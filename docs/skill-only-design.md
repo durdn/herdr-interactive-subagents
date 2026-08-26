@@ -1,5 +1,11 @@
 # Skill-only orchestration design (future, not implemented)
 
+> **Superseded.** This document asked whether a skill could replace the pi extension and answered
+> "only for synchronous delegation". That was true of Claude Code at the time of writing. It is no
+> longer: cross-session `SendMessage`, `notify_when_idle`, `--session-id`/`--resume`, and role
+> definitions cover every gap the table below lists. The shipped design and the spike that
+> verified it are in [`claude-orchestrator.md`](claude-orchestrator.md). Kept for the reasoning.
+
 ## Question
 
 Can Herdr's native layout and agent APIs replace the pi extension so a generic orchestrator such as Claude Code or Codex needs only a skill file?

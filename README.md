@@ -181,9 +181,38 @@ npm run test:surface     # real Herdr tabs, no model calls; run inside Herdr
 npm run test:integration # full lifecycle tests with model calls
 ```
 
-## Skill-only future
+## Claude Code as the orchestrator
 
-Herdr's native `tab create`, `agent start`, `agent prompt --wait`, `agent wait`, and `agent read` primitives can support a narrower, generic Claude Code/Codex skill. A skill alone cannot provide the current resident async callback, persistent finished-session registry, sandbox replay, nested allowlist enforcement, or `ask_question` routing. The design exploration is documented in [`docs/skill-only-design.md`](docs/skill-only-design.md); no generic skill is shipped yet.
+pi cannot drive Claude Code on a Claude subscription, so this repository also ships a second,
+independent path: **Claude Code orchestrates, and each child is a Claude Code session in its own
+background tab in the orchestrator's Herdr workspace.** Same topology, no pi in the loop.
+
+It lives in [`claude-plugin/`](claude-plugin) and is a Claude Code plugin - one skill, four slash
+commands, four roles, and a single script:
+
+```bash
+node claude-plugin/scripts/hs.mjs install    # links it into ~/.claude/skills/
+node claude-plugin/scripts/hs.mjs doctor
+```
+
+Restart Claude Code afterwards. Then, inside a Herdr pane:
+
+```text
+/subagent scout map the auth module
+/subagents
+/subagent-stop --all
+```
+
+The design deliberately implements almost nothing. Claude Code 2.1.246 supplies the pieces this
+pi extension had to build by hand - `SendMessage` cross-session delivery is the async callback,
+session names are the address registry, `--session-id` plus `--resume` is the session sandbox,
+and a child's question to its parent is just a message. Herdr supplies the tab, the visibility,
+and the `working`/`blocked`/`done` lifecycle. What is left is the spawn contract and cleanup.
+
+[`docs/claude-orchestrator.md`](docs/claude-orchestrator.md) records the design and the spike that
+verified each primitive on Windows. It supersedes the conclusion of
+[`docs/skill-only-design.md`](docs/skill-only-design.md), which asked this question a version of
+Claude Code too early and answered "synchronous delegation only".
 
 ## Development lineage
 

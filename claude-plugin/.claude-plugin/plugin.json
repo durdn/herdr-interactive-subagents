@@ -1,0 +1,7 @@
+{
+  "name": "herdr-subagents",
+  "version": "0.1.0",
+  "description": "Run Claude Code subagents in background tabs in the orchestrator's Herdr workspace",
+  "keywords": ["herdr", "subagents", "orchestration"],
+  "license": "MIT"
+}

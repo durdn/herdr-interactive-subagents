@@ -19,3 +19,18 @@ command = ["node", "scripts/pi-package.mjs", "remove"]
 id = "doctor"
 title = "Check Herdr interactive-subagent setup"
 command = ["node", "scripts/pi-package.mjs", "doctor"]
+
+[[actions]]
+id = "install-claude"
+title = "Install the Claude Code orchestrator plugin"
+command = ["node", "claude-plugin/scripts/hs.mjs", "install"]
+
+[[actions]]
+id = "remove-claude"
+title = "Remove the Claude Code orchestrator plugin"
+command = ["node", "claude-plugin/scripts/hs.mjs", "uninstall"]
+
+[[actions]]
+id = "doctor-claude"
+title = "Check the Claude Code orchestrator setup"
+command = ["node", "claude-plugin/scripts/hs.mjs", "doctor"]

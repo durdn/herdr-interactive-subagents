@@ -1,19 +1,21 @@
 {
-  "name": "pi-interactive-subagents",
-  "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
+  "name": "herdr-interactive-subagents",
+  "version": "4.0.0",
+  "description": "Herdr-native interactive subagents for pi, running in sibling tabs in the orchestrator's workspace",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "herdr-plugin"
   ],
   "license": "MIT",
   "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
+    "url": "https://github.com/durdn/herdr-interactive-subagents"
   },
   "type": "module",
   "scripts": {
     "test": "node --test test/test.ts",
+    "test:surface": "node --test --test-concurrency=1 test/integration/herdr-surface.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

@@ -1,14 +1,13 @@
 /**
- * Integration test harness for pi-interactive-subagents.
+ * Integration test harness for herdr-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux is available
+ * - Detect whether Herdr is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
+ * - Start real pi sessions in background Herdr tabs
  * - Poll for file creation and screen output
- * - Clean up panes and temp files after tests
+ * - Clean up tabs and temp files after tests
  */
-import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -17,6 +16,7 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -32,9 +32,11 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+  focusSurface,
+  getFocusedSurface,
+} from "../../pi-extension/subagents/herdr.ts";
 
-// Re-export tmux primitives for tests
+// Re-export Herdr surface primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -44,6 +46,8 @@ export {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  focusSurface,
+  getFocusedSurface,
 };
 
 // ── Paths ──
@@ -75,28 +79,9 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
- */
+/** Detect whether this process can control its Herdr session. */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
-}
-
-export function focusSurface(surface: string): void {
-  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
-}
-
-export function getFocusedSurface(): string | null {
-  try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-      encoding: "utf8",
-    });
-    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-    return activeLine?.split(" ")[0] ?? null;
-  } catch {
-    return null;
-  }
+  return isMuxAvailable() ? ["herdr"] : [];
 }
 
 export async function waitForFocusedSurface(
@@ -110,7 +95,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused Herdr pane ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
@@ -139,7 +124,16 @@ export function createTestEnv(): TestEnv {
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const source = join(TEST_AGENTS_SRC, file);
+        const destination = join(agentsDir, file);
+        cpSync(source, destination);
+        // PI_TEST_MODEL is documented as the model for all integration-test
+        // sessions, including the child role definitions copied here.
+        const content = readFileSync(destination, "utf8").replace(
+          /^model:\s*.+$/m,
+          `model: ${TEST_MODEL}`,
+        );
+        writeFileSync(destination, content, "utf8");
       }
     }
   }

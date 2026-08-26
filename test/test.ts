@@ -30,7 +30,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +56,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
 
@@ -1209,8 +1209,14 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+    const webSearchPath = testApi.getToolExtensionPath("web_search");
+    assert.ok(
+      webSearchPath === undefined || webSearchPath.endsWith("web-search/index.ts"),
+      "web_search resolves to its backing extension when that optional extension is installed",
+    );
+    assert.ok(
+      testApi.getToolExtensionPath("safe_bash")?.replace(/\\/g, "/").endsWith("tools/safe-bash.ts"),
+    );
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
@@ -1741,7 +1747,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
+describe("herdr.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
@@ -2465,28 +2471,46 @@ describe("subagent startup delay", () => {
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const originalHerdr = process.env.HERDR_SUBAGENT_SHELL_READY_DELAY_MS;
+    const originalPi = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    delete process.env.HERDR_SUBAGENT_SHELL_READY_DELAY_MS;
     delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
     try {
       assert.equal(testApi.getShellReadyDelayMs(), 500);
     } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+      restoreEnvVar("HERDR_SUBAGENT_SHELL_READY_DELAY_MS", originalHerdr);
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", originalPi);
     }
   });
 
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
+  it("uses HERDR_SUBAGENT_SHELL_READY_DELAY_MS and prefers it over the legacy fallback", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+    const originalHerdr = process.env.HERDR_SUBAGENT_SHELL_READY_DELAY_MS;
+    const originalPi = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    process.env.HERDR_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "3000";
     try {
       assert.equal(testApi.getShellReadyDelayMs(), 2500);
     } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+      restoreEnvVar("HERDR_SUBAGENT_SHELL_READY_DELAY_MS", originalHerdr);
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", originalPi);
+    }
+  });
+
+  it("keeps PI_SUBAGENT_SHELL_READY_DELAY_MS as a compatibility fallback", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const originalHerdr = process.env.HERDR_SUBAGENT_SHELL_READY_DELAY_MS;
+    const originalPi = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    delete process.env.HERDR_SUBAGENT_SHELL_READY_DELAY_MS;
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2250";
+    try {
+      assert.equal(testApi.getShellReadyDelayMs(), 2250);
+    } finally {
+      restoreEnvVar("HERDR_SUBAGENT_SHELL_READY_DELAY_MS", originalHerdr);
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", originalPi);
     }
   });
 });
@@ -2652,7 +2676,7 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
+describe("herdr.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

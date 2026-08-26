@@ -1,0 +1,21 @@
+id = "durdn.interactive-subagents"
+name = "Interactive Subagents"
+version = "4.0.0"
+min_herdr_version = "0.8.0"
+description = "Run pi subagents in background tabs in the orchestrator's Herdr workspace"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "install-pi"
+title = "Install the companion pi package"
+command = ["node", "scripts/pi-package.mjs", "install"]
+
+[[actions]]
+id = "remove-pi"
+title = "Remove the companion pi package"
+command = ["node", "scripts/pi-package.mjs", "remove"]
+
+[[actions]]
+id = "doctor"
+title = "Check Herdr interactive-subagent setup"
+command = ["node", "scripts/pi-package.mjs", "doctor"]

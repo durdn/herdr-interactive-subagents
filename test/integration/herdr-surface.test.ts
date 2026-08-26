@@ -1,12 +1,12 @@
 /**
- * Integration tests for the tmux surface layer.
+ * Integration tests for the Herdr tab surface layer.
  *
- * These tests exercise real tmux operations: creating panes,
- * sending commands, reading screen output, and closing panes.
+ * These tests exercise real Herdr operations: creating background tabs,
+ * sending commands, reading terminal output, and closing tabs.
  * No LLM calls — fast and free.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run from a pi session inside Herdr:
+ *   npm run test:surface
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -35,15 +35,15 @@ import {
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
-const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
+const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.HERDR_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping tmux-surface integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("⚠️  Herdr is not available — skipping Herdr surface integration tests");
+  console.log("   Run from a Herdr-managed pane to enable these tests.");
 }
 
 for (const backend of backends) {
-  describe(`tmux-surface [${backend}]`, { timeout: 60_000 }, () => {
+  describe(`herdr-surface [${backend}]`, { timeout: 60_000 }, () => {
     let env: TestEnv;
 
     before(() => {
@@ -180,9 +180,12 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      const filePath = `/tmp/pi-tmux-test-${marker}.txt`;
+      const filePath = `${env.dir.replace(/\\/g, "/")}/pi-herdr-test-${marker}.txt`;
 
-      sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
+      sendCommand(
+        surface,
+        `node -e "require('node:fs').writeFileSync(process.argv[1], process.argv[2])" '${filePath}' 'FILE_${marker}'; echo "WRITTEN_${marker}"`,
+      );
 
       await waitForScreen(surface, new RegExp(`WRITTEN_${marker}`), 10_000, 50);
       const content = await waitForFile(filePath, 10_000, new RegExp(`FILE_${marker}`));

@@ -2,14 +2,14 @@
  * Integration tests for the full subagent lifecycle.
  *
  * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a tmux pane, runs pi with a task that uses the subagent
+ * Each test creates a Herdr tab, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
  * Costs: ~$0.01-0.05 per test run (haiku).
  * Duration: ~30-90s per test.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run from a Herdr-managed pane:
+ *   npm run test:integration
  *
  * Configuration:
  *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
@@ -36,9 +36,13 @@ import {
 
 const backends = getAvailableBackends();
 
+function tempMarker(env: TestEnv, filename: string): string {
+  return `${env.dir.replace(/\\/g, "/")}/${filename}`;
+}
+
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("⚠️  Herdr is not available — skipping subagent lifecycle integration tests");
+  console.log("   Run from a Herdr-managed pane to enable these tests.");
 }
 
 for (const backend of backends) {
@@ -57,7 +61,7 @@ for (const backend of backends) {
 
     it("spawns a subagent that writes a file and verifies the session", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
+      const markerFile = tempMarker(env, `pi-integ-echo-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `echo-${id}`);
@@ -107,8 +111,8 @@ for (const backend of backends) {
 
     it("keeps a long active tool call from surfacing false stalled status", async () => {
       const id = uniqueId();
-      const startFile = `/tmp/pi-integ-status-start-${id}.txt`;
-      const markerFile = `/tmp/pi-integ-status-${id}.txt`;
+      const startFile = tempMarker(env, `pi-integ-status-start-${id}.txt`);
+      const markerFile = tempMarker(env, `pi-integ-status-${id}.txt`);
       trackTempFile(env, startFile);
       trackTempFile(env, markerFile);
 
@@ -152,8 +156,8 @@ for (const backend of backends) {
 
     it("spawns two subagents in parallel and both complete", async () => {
       const id = uniqueId();
-      const fileA = `/tmp/pi-integ-para-${id}-a.txt`;
-      const fileB = `/tmp/pi-integ-para-${id}-b.txt`;
+      const fileA = tempMarker(env, `pi-integ-para-${id}-a.txt`);
+      const fileB = tempMarker(env, `pi-integ-para-${id}-b.txt`);
       trackTempFile(env, fileA);
       trackTempFile(env, fileB);
 
@@ -192,7 +196,7 @@ for (const backend of backends) {
 
     it("fork mode creates a child session linked to the parent", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
+      const markerFile = tempMarker(env, `pi-integ-fork-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `fork-${id}`);
@@ -274,7 +278,7 @@ for (const backend of backends) {
 
     it("subagent discovers project-local test agents", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
+      const markerFile = tempMarker(env, `pi-integ-discovery-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `discovery-${id}`);
@@ -302,7 +306,7 @@ for (const backend of backends) {
 
     it("passes systemPrompt to subagent", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
+      const markerFile = tempMarker(env, `pi-integ-sysprompt-${id}.txt`);
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `sysprompt-${id}`);

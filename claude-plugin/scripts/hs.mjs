@@ -530,6 +530,52 @@ function installLink() {
   return join(homedir(), ".claude", "skills", "herdr-subagents");
 }
 
+// Claude Code loads ~/.claude/skills/<name>/SKILL.md. Linking the plugin ROOT
+// there buries SKILL.md at skills/herdr-subagents/SKILL.md, two levels too deep,
+// so the skill silently never loads - the link exists and nothing works.
+function skillSource() {
+  return join(PLUGIN_DIR, "skills", "herdr-subagents");
+}
+
+// Loose .md files in ~/.claude/commands each become a slash command. The command
+// bodies carry a "<plugin>" placeholder because they are also read as plugin
+// commands, where CLAUDE_PLUGIN_ROOT is set; a deployed copy has to spell the
+// path out. Marked so uninstall only ever removes what install wrote.
+const COMMAND_MARKER = "<!-- deployed by hs.mjs; edits belong in the plugin repo -->";
+
+function commandTargets() {
+  const dir = join(PLUGIN_DIR, "commands");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".md"))
+    .map((f) => ({
+      name: f,
+      source: join(dir, f),
+      dest: join(homedir(), ".claude", "commands", f),
+    }));
+}
+
+function deployCommands() {
+  const done = [];
+  for (const c of commandTargets()) {
+    // Forward slashes: the placeholder is always followed by /scripts/..., and node
+    // and both shells accept them on Windows, so this avoids a mixed-separator path.
+    const root = PLUGIN_DIR.split("\\").join("/");
+    const body = readFileSync(c.source, "utf8").split("<plugin>").join(root);
+    mkdirSync(join(c.dest, ".."), { recursive: true });
+    if (existsSync(c.dest) && !readFileSync(c.dest, "utf8").includes(COMMAND_MARKER)) {
+      console.log(`skipped ${c.dest} (not ours - remove it by hand to deploy)`);
+      continue;
+    }
+    writeFileSync(c.dest, `${body.trimEnd()}
+
+${COMMAND_MARKER}
+`);
+    done.push(c.name.replace(/\.md$/, ""));
+  }
+  return done;
+}
+
 function linkTarget(path) {
   try {
     return lstatSync(path).isSymbolicLink() ? resolve(readlinkSync(path)) : null;
@@ -540,18 +586,27 @@ function linkTarget(path) {
 
 function cmdInstall() {
   const link = installLink();
-  if (existsSync(link) || linkTarget(link)) {
-    const target = linkTarget(link);
-    if (target === PLUGIN_DIR) {
-      console.log(`already installed: ${link} -> ${target}`);
-      return;
-    }
+  const want = skillSource();
+  if (!existsSync(want)) die(`no skill to install at ${want}`);
+  const target = linkTarget(link);
+  if (target === want) {
+    console.log(`already installed: ${link} -> ${target}`);
+  } else if (target === PLUGIN_DIR) {
+    // Repair the pre-2026-08-26 layout, which linked the plugin root and so
+    // never surfaced the skill at all.
+    rmSync(link, { recursive: false, force: true });
+    symlinkSync(want, link, process.platform === "win32" ? "junction" : "dir");
+    console.log(`repaired: ${link} -> ${want} (was the plugin root, so the skill never loaded)`);
+  } else if (existsSync(link) || target) {
     die(`${link} already exists${target ? ` (points at ${target})` : ""}; remove it first`);
+  } else {
+    mkdirSync(join(link, ".."), { recursive: true });
+    // "junction" is the only link type Windows grants without elevation.
+    symlinkSync(want, link, process.platform === "win32" ? "junction" : "dir");
+    console.log(`installed: ${link} -> ${want}`);
   }
-  mkdirSync(join(link, ".."), { recursive: true });
-  // "junction" is the only link type Windows grants without elevation.
-  symlinkSync(PLUGIN_DIR, link, process.platform === "win32" ? "junction" : "dir");
-  console.log(`installed: ${link} -> ${PLUGIN_DIR}`);
+  const deployed = deployCommands();
+  console.log(deployed.length ? `commands: ${deployed.map((d) => `/${d}`).join(" ")}` : "commands: none");
   console.log("Restart Claude Code to pick up the skill and commands.");
 }
 
@@ -564,6 +619,12 @@ function cmdUninstall() {
   if (!linkTarget(link) && !lstatSync(link).isDirectory()) die(`${link} is not a link we created`);
   rmSync(link, { recursive: false, force: true });
   console.log(`removed ${link}`);
+  for (const c of commandTargets()) {
+    if (existsSync(c.dest) && readFileSync(c.dest, "utf8").includes(COMMAND_MARKER)) {
+      rmSync(c.dest, { force: true });
+      console.log(`removed ${c.dest}`);
+    }
+  }
 }
 
 function cmdDoctor() {
@@ -592,11 +653,19 @@ function cmdDoctor() {
 
   check(Boolean(process.env.CLAUDE_CODE_MESSAGING_SOCKET), "this session binds a messaging inbox");
   check(existsSync(PLUGIN_DIR), `plugin directory present (${PLUGIN_DIR})`);
-  const linked = linkTarget(installLink()) === PLUGIN_DIR;
+  // Assert the skill is LOADABLE, not merely that a link exists: the old layout
+  // linked the plugin root, which passes an existence check and loads nothing.
+  const loadable = existsSync(join(installLink(), "SKILL.md"));
   console.log(
-    `${linked ? "ok  " : "note"}  ${linked
-      ? `installed at ${installLink()}`
-      : "not installed for the orchestrator (run: hs.mjs install) - spawning still works"}`,
+    `${loadable ? "ok  " : "note"}  ${loadable
+      ? `skill loadable at ${installLink()}`
+      : "skill NOT loadable by the orchestrator (run: hs.mjs install) - spawning still works"}`,
+  );
+  const missing = commandTargets().filter((c) => !existsSync(c.dest)).map((c) => c.name);
+  console.log(
+    `${missing.length ? "note" : "ok  "}  ${missing.length
+      ? `commands not deployed: ${missing.join(", ")} (run: hs.mjs install)`
+      : `commands deployed (${commandTargets().length})`}`,
   );
   const roles = discoverRoles();
   check(roles.size > 0, `roles discovered (${[...roles.keys()].join(", ") || "none"})`);

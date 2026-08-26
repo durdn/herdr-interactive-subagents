@@ -108,6 +108,13 @@ rather than guessing.
   `<role>-<4 hex>`; pass `--name` for something meaningful.
 - **Stopping must not forget the child.** Closing the tab ends the process, not the session, so
   the registry entry is marked rather than deleted and `resume` can still replay it.
+- **The two completion signals have very different latency.** A child's own `SendMessage` reply
+  arrived mid-turn, seconds after it finished, every time. The `notify_when_idle` notices for the
+  same children arrived batched at the orchestrator's next turn boundary - one of them about 25
+  minutes after the turn it reported. So the child's message is the result channel; the notice is
+  a backstop that says a child finished or died, and it may be stale when it lands. It does report
+  an exit (`has exited before going idle`), which is how a dead child is distinguished from a slow
+  one.
 - **The transcript's last assistant text is not the result.** A child that reports correctly does
   so with a `SendMessage` tool call and often prints something afterwards. `hs.mjs result` returns
   the last `SendMessage` argument when there is one, and falls back to the last text.

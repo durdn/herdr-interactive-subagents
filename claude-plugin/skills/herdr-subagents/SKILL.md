@@ -48,8 +48,12 @@ SendMessage({ to: "<handle>", message: "<the whole task>", notify_when_idle: tru
 
 Put everything the child needs in that message. It does not inherit one word of this
 conversation — no file paths you have been discussing, no decisions already made, no context from
-earlier turns. `notify_when_idle: true` guarantees one notice when it finishes even if it dies
-without answering.
+earlier turns.
+
+`notify_when_idle: true` is a backstop, not the result channel: it fires once when the child next
+goes idle or exits, so you still hear about a child that died without answering. Expect it to be
+late - it lands at your own turn boundary and can arrive long after the child actually finished.
+The child's own reply is what arrives promptly.
 
 **3. Carry on.** Do not poll, do not loop on `hs list`, do not send "are you done?". The result
 arrives on its own as a `<cross-session-message>` and starts a new turn here. Work on something

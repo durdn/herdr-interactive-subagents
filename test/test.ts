@@ -56,6 +56,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+import webToolsExtension from "../pi-extension/subagents/tools/web-tools.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
@@ -685,6 +686,7 @@ describe("status.ts", () => {
 
     assert.deepEqual(disabled, {
       enabled: false,
+      notifyParent: false,
       lineLimit: 4,
     });
   });
@@ -695,6 +697,7 @@ describe("status.ts", () => {
 
     assert.deepEqual(config, {
       enabled: true,
+      notifyParent: false,
       lineLimit: 4,
     });
   });
@@ -711,9 +714,17 @@ describe("status.ts", () => {
 
       assert.deepEqual(config, {
         enabled: true,
+        notifyParent: false,
         lineLimit: 4,
       });
     });
+  });
+
+  it("supports opt-in parent status notifications", () => {
+    assert.deepEqual(
+      parseStatusConfig({ status: { enabled: true, notifyParent: true } }),
+      { enabled: true, notifyParent: true, lineLimit: 4 },
+    );
   });
 
   it("fails fast for invalid config shapes", () => {
@@ -1192,10 +1203,59 @@ describe("subagent discovery", () => {
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
     const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
+    for (const t of [
+      "subagent",
+      "subagent_message",
+      "subagent_cancel",
+      "subagent_cancel_all",
+      "subagents_list",
+    ]) {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
     assert.ok(tools.has("bash"), "expected worker to keep bash");
+  });
+
+  it("inherits the parent model when the role and spawn do not override it", () => {
+    assert.equal(
+      testApi.resolveEffectiveModel(
+        { agent: "scout", task: "map it" },
+        { autoExit: true },
+        { provider: "openai-codex", id: "gpt-5.6-luna" },
+      ),
+      "openai-codex/gpt-5.6-luna",
+    );
+    assert.equal(
+      testApi.resolveEffectiveModel(
+        { agent: "scout", task: "map it", model: "openai-codex/gpt-5.6-sol" },
+        { model: "bundled/model" },
+        { provider: "parent", id: "model" },
+      ),
+      "openai-codex/gpt-5.6-sol",
+    );
+  });
+
+  it("accepts Windows absolute cwd values without joining them to the parent cwd", () => {
+    const windowsCwd = "C:\\Users\\durdn\\dev\\herdr-interactive-subagents";
+    assert.equal(testApi.isAbsoluteSubagentPath(windowsCwd), true);
+    assert.equal(
+      testApi.resolveSubagentPaths(
+        { agent: "worker", task: "fix it", cwd: windowsCwd },
+        null,
+      ).effectiveCwd,
+      windowsCwd,
+    );
+  });
+
+  it("never treats cwd/.pi/agent as PI_CODING_AGENT_DIR", async () => {
+    await withIsolatedAgentEnv(({ projectDir, globalDir }) => {
+      mkdirSync(join(projectDir, ".pi", "agent"), { recursive: true });
+      const resolved = testApi.resolveSubagentPaths(
+        { agent: "worker", task: "fix it", cwd: "." },
+        null,
+      );
+      assert.equal(resolved.effectiveCwd, projectDir);
+      assert.equal(resolved.effectiveAgentDir, globalDir);
+    });
   });
 
   it("scout and researcher are not granted spawning tools", () => {
@@ -1210,9 +1270,18 @@ describe("subagent discovery", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
     const webSearchPath = testApi.getToolExtensionPath("web_search");
+    const webFetchPath = testApi.getToolExtensionPath("web_fetch");
+    assert.ok(webSearchPath, "web_search must always have a backing extension");
+    assert.ok(webFetchPath, "web_fetch must always have a backing extension");
+    const normalizedSearchPath = webSearchPath.replace(/\\/g, "/");
+    const normalizedFetchPath = webFetchPath.replace(/\\/g, "/");
     assert.ok(
-      webSearchPath === undefined || webSearchPath.endsWith("web-search/index.ts"),
-      "web_search resolves to its backing extension when that optional extension is installed",
+      normalizedSearchPath.endsWith("web-search/index.ts") || normalizedSearchPath.endsWith("tools/web-tools.ts"),
+      `unexpected web_search extension path: ${webSearchPath}`,
+    );
+    assert.ok(
+      normalizedFetchPath.endsWith("web-fetch/index.ts") || normalizedFetchPath.endsWith("tools/web-tools.ts"),
+      `unexpected web_fetch extension path: ${webFetchPath}`,
     );
     assert.ok(
       testApi.getToolExtensionPath("safe_bash")?.replace(/\\/g, "/").endsWith("tools/safe-bash.ts"),
@@ -1748,7 +1817,7 @@ describe("subagent-done.ts", () => {
 });
 
 describe("herdr.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
+  const { interpretExitSidecar, isPaneNotFoundError } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
     // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
@@ -1792,6 +1861,14 @@ describe("herdr.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
+
+  it("recognizes Herdr pane-not-found failures for orphan cleanup", () => {
+    assert.equal(
+      isPaneNotFoundError({ stderr: '{"error":{"code":"pane_not_found","message":"pane w1:p9 not found"}}' }),
+      true,
+    );
+    assert.equal(isPaneNotFoundError(new Error("temporary socket error")), false);
+  });
 });
 describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
@@ -1820,6 +1897,15 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("bundles the researcher web tools", () => {
+    const registeredTools: any[] = [];
+    webToolsExtension({ registerTool(tool: any) { registeredTools.push(tool); } } as any);
+    assert.deepEqual(
+      registeredTools.map((tool) => tool.name).sort(),
+      ["web_fetch", "web_search"],
+    );
+  });
+
   it("always resumes subagents as autonomous (auto-exit, non-interactive tracking)", () => {
     const testApi = (subagentsModule as any).__test__;
 
@@ -1927,10 +2013,12 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
-  it("no longer registers subagent_interrupt or subagent_resume", () => {
+  it("registers explicit one/all cancellation tools", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
+    assert.equal(names.includes("subagent_cancel"), true);
+    assert.equal(names.includes("subagent_cancel_all"), true);
     assert.equal(names.includes("subagent_interrupt"), false);
     assert.equal(names.includes("subagent_resume"), false);
   });
@@ -2335,6 +2423,46 @@ describe("subagent interruption", () => {
 
       assert.match(result.content[0].text, /Failed to deliver message/);
       assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("cancels one running subagent even when its Herdr pane is already gone", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const abortController = new AbortController();
+    const running = makeRunning({ abortController });
+    runningMap.clear();
+    runningMap.set(running.id, running);
+
+    try {
+      const result = testApi.cancelRunningSubagent(running, () => {
+        throw new Error("pane_not_found");
+      });
+      assert.deepEqual(result, { name: "Worker", surfaceClosed: false });
+      assert.equal(abortController.signal.aborted, true);
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("cancels all running subagents and clears the lifecycle map", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closed: string[] = [];
+    runningMap.clear();
+    runningMap.set("a1", makeRunning({ id: "a1", name: "One", surface: "pane-1" }));
+    runningMap.set("a2", makeRunning({ id: "a2", name: "Two", surface: "pane-2" }));
+
+    try {
+      assert.deepEqual(
+        testApi.cancelAllRunningSubagents((surface: string) => closed.push(surface)),
+        ["One", "Two"],
+      );
+      assert.deepEqual(closed, ["pane-1", "pane-2"]);
+      assert.equal(runningMap.size, 0);
     } finally {
       runningMap.clear();
     }

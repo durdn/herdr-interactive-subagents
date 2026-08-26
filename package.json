@@ -1,6 +1,6 @@
 {
   "name": "herdr-interactive-subagents",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Herdr-native interactive subagents for pi, running in sibling tabs in the orchestrator's workspace",
   "keywords": [
     "pi-package",

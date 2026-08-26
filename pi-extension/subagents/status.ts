@@ -19,6 +19,7 @@ export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
 export interface StatusConfig {
   enabled: boolean;
+  notifyParent: boolean;
   lineLimit: number;
 }
 
@@ -140,11 +141,15 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled"], source, "status");
+  rejectUnsupportedKeys(status, ["enabled", "notifyParent"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
+  const notifyParent = status.notifyParent == null
+    ? false
+    : requireBoolean(status.notifyParent, source, "status.notifyParent");
 
   return {
     enabled,
+    notifyParent,
     lineLimit: DEFAULT_STATUS_LINE_LIMIT,
   };
 }

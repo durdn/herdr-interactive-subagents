@@ -2,6 +2,10 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), hosted natively by [Herdr](https://herdr.dev). Each subagent runs in a **background tab in the orchestrator's current Herdr workspace**. The spawn returns immediately; completion is steered back into the orchestrator as a new pi turn.
 
+## Acknowledgements
+
+This project was forked from [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents). We are grateful to its authors and contributors, and to everyone whose work preceded theirs. This repository is only the latest link in that development chain.
+
 This repository is both:
 
 - a pi package that provides the orchestration tools and rich TUI rendering; and
@@ -78,6 +82,8 @@ export HERDR_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | --- | --- |
 | `subagent` | Spawn a subagent in a background Herdr tab (async) |
 | `subagent_message` | Message a child by name; steer it live or resume its finished pi session |
+| `subagent_cancel` | Cancel one running child and clean up its tab/widget entry |
+| `subagent_cancel_all` | Cancel all running children and clear their tabs/widget entries |
 | `subagents_list` | List discoverable role definitions |
 | `ask_question` | Child-only: ask the orchestrator one question and remain parked for its reply |
 
@@ -106,6 +112,7 @@ subagent_message({ name: "scout", message: "Also inspect the middleware" });
 
 - **Running:** submits the message to the live Herdr pane and returns immediately.
 - **Finished:** resumes the original pi session with the exact snapshotted sandbox and reclaims the name; its result arrives asynchronously.
+- **Cancellation:** use `subagent_cancel({ name })` or `subagent_cancel_all({})`; manually closed Herdr tabs are also detected and removed from the widget.
 
 Name mappings live under the orchestrator session's `artifacts/<sessionId>/subagent-registry.json` and survive pi restarts.
 
@@ -117,9 +124,9 @@ A child can call `ask_question` when one decision materially affects its work. I
 
 | Role | Model | Tools | Purpose |
 | --- | --- | --- | --- |
-| `scout` | `openrouter/z-ai/glm-5.3` | read-only code tools | Fast codebase reconnaissance |
-| `researcher` | `openrouter/z-ai/glm-5.3` | web tools and safe bash | Sourced external research |
-| `worker` | `openrouter/z-ai/glm-5.3` | read/write/edit/bash/web plus spawning | General implementation |
+| `scout` | parent model | read-only code tools | Fast codebase reconnaissance |
+| `researcher` | parent model | bundled read-only web tools | Sourced external research |
+| `worker` | parent model | read/write/edit/bash/web plus spawning | General implementation |
 
 ## Custom roles
 
@@ -129,7 +136,6 @@ Put role files in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Pri
 ---
 name: reviewer
 description: Reviews a change
-model: openrouter/z-ai/glm-5.3
 thinking: medium
 tools: read, grep, find
 session-mode: lineage-only
@@ -142,6 +148,7 @@ Review the requested change and return actionable findings.
 
 Important frontmatter:
 
+- `model`: optional explicit override; omit it to inherit the orchestrator's active model.
 - `tools`: strict allowlist; extension-backed tools are loaded only when requested.
 - `subagent_agents`: grants the spawning tools and restricts nested spawn targets.
 - `session-mode`: `standalone`, `lineage-only`, or `fork`.
@@ -160,11 +167,11 @@ Copy `config.json.example` to `config.json` to override package-local status beh
 
 ```json
 {
-  "status": { "enabled": true }
+  "status": { "enabled": true, "notifyParent": false }
 }
 ```
 
-The Pi widget shows launch/activity details. Herdr independently provides workspace/tab rollups, agent navigation, unseen `done` state, and blocked-agent visibility.
+The Pi widget shows launch/activity details. `notifyParent` is off by default so status transitions do not wake the orchestrator and consume a model turn; set it to `true` for proactive stalled/recovered messages. Herdr independently provides workspace/tab rollups, agent navigation, unseen `done` state, and blocked-agent visibility.
 
 ## Tests
 
@@ -178,9 +185,9 @@ npm run test:integration # full lifecycle tests with model calls
 
 Herdr's native `tab create`, `agent start`, `agent prompt --wait`, `agent wait`, and `agent read` primitives can support a narrower, generic Claude Code/Codex skill. A skill alone cannot provide the current resident async callback, persistent finished-session registry, sandbox replay, nested allowlist enforcement, or `ask_question` routing. The design exploration is documented in [`docs/skill-only-design.md`](docs/skill-only-design.md); no generic skill is shipped yet.
 
-## Acknowledgements
+## Development lineage
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). The earlier tmux-focused fork established the current session sandbox, supervision, and async result architecture; this version replaces the multiplexer surface with Herdr workspace/tab primitives.
+The upstream lineage also includes [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). That earlier tmux-focused work established the current session sandbox, supervision, and async result architecture; this version replaces the multiplexer surface with Herdr workspace/tab primitives.
 
 ## License
 

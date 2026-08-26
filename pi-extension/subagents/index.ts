@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -158,6 +158,8 @@ interface ListedAgentDefinition extends AgentDefinition {
 const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
+  "subagent_cancel",
+  "subagent_cancel_all",
   "subagents_list",
 ] as const;
 
@@ -216,20 +218,25 @@ function getToolExtensionPath(tool: string): string | undefined {
     return fileURLToPath(import.meta.url);
   }
   const extBase = join(getAgentConfigDir(), "extensions");
-  const map: Record<string, string> = {
+  const optionalMap: Record<string, string> = {
     web_search: join(extBase, "web-search", "index.ts"),
     web_fetch: join(extBase, "web-fetch", "index.ts"),
     video_extract: join(extBase, "video-extract", "index.ts"),
     youtube_search: join(extBase, "youtube-search", "index.ts"),
     google_image_search: join(extBase, "google-image-search", "index.ts"),
-    safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
   };
-  // Prefer the built-in path, but fall back to a runtime-registered extension
-  // when that path no longer exists on disk (e.g. a built-in tool extension
-  // was disabled/removed but a project-local extension re-registered it).
-  const builtin = map[tool];
-  if (builtin && existsSync(builtin)) return builtin;
-  return EXTRA_TOOL_EXTENSIONS.get(tool);
+  // Prefer a user's dedicated extension. The package bundles a dependency-free
+  // web fallback so its researcher role never advertises tools that disappear
+  // from the child sandbox on a clean installation.
+  const optional = optionalMap[tool];
+  if (optional && existsSync(optional)) return optional;
+  const registered = EXTRA_TOOL_EXTENSIONS.get(tool);
+  if (registered) return registered;
+  if (tool === "web_search" || tool === "web_fetch") {
+    return join(SUBAGENTS_DIR, "tools", "web-tools.ts");
+  }
+  if (tool === "safe_bash") return join(SUBAGENTS_DIR, "tools", "safe-bash.ts");
+  return undefined;
 }
 
 /**
@@ -330,22 +337,44 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
 }
 
+function isAbsoluteSubagentPath(path: string): boolean {
+  // node:path follows the host platform. Also recognize Windows drive-letter
+  // and UNC paths when tests or orchestration run through a POSIX shell.
+  return isAbsolute(path) || win32.isAbsolute(path);
+}
+
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
+): { effectiveCwd: string | null; effectiveAgentDir: string } {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
   const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
+    ? isAbsoluteSubagentPath(rawCwd)
       ? rawCwd
-      : join(cwdBase, rawCwd)
+      : resolve(cwdBase, rawCwd)
     : null;
-  const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
-  const effectiveAgentDir =
-    localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
+
+  // A child working directory may happen to contain `.pi/agent` (notably a
+  // dotfiles checkout that backs up the global Pi directory). That does not
+  // make it a replacement PI_CODING_AGENT_DIR. Keep auth, trust, packages, and
+  // global roles rooted in the parent's real config directory; Pi discovers
+  // project-local resources from `<cwd>/.pi` independently.
+  return { effectiveCwd, effectiveAgentDir: getAgentConfigDir() };
+}
+
+function resolveEffectiveModel(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  parentModel?: { provider?: string; id?: string } | null,
+): string | undefined {
+  if (params.model) return params.model;
+  if (agentDefs?.model) return agentDefs.model;
+  if (parentModel?.provider && parentModel.id) {
+    return `${parentModel.provider}/${parentModel.id}`;
+  }
+  return undefined;
 }
 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
@@ -1061,6 +1090,36 @@ function handleSubagentSteer(
   };
 }
 
+function cancelRunningSubagent(
+  running: RunningSubagent,
+  close: (surface: string) => void = closeSurface,
+): { name: string; surfaceClosed: boolean } {
+  running.abortController?.abort();
+  let surfaceClosed = true;
+  try {
+    close(running.surface);
+  } catch {
+    // The user may already have closed the Herdr tab. Cancellation still owns
+    // and clears the parent-side lifecycle entry.
+    surfaceClosed = false;
+  }
+  runningSubagents.delete(running.id);
+  updateWidget();
+  return { name: running.name, surfaceClosed };
+}
+
+function cancelAllRunningSubagents(
+  close: (surface: string) => void = closeSurface,
+): string[] {
+  const cancelled: string[] = [];
+  for (const running of [...runningSubagents.values()]) {
+    cancelRunningSubagent(running, close);
+    cancelled.push(running.name);
+  }
+  updateWidget();
+  return cancelled;
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1097,7 +1156,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
     if (shouldRefreshWidget) updateWidget();
 
-    if (transitionLines.length > 0) {
+    if (statusConfig.notifyParent && transitionLines.length > 0) {
       const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
       pi.sendMessage(
         {
@@ -1131,6 +1190,9 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveSubagentPaths,
+  resolveEffectiveModel,
+  isAbsoluteSubagentPath,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -1142,6 +1204,8 @@ export const __test__ = {
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
+  cancelRunningSubagent,
+  cancelAllRunningSubagents,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -1170,14 +1234,18 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    cwd: string;
+    model?: { provider?: string; id?: string } | null;
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveModel = resolveEffectiveModel(params, agentDefs, ctx.model);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1188,7 +1256,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1324,13 +1392,9 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
-  // else the propagated global dir. Captured once so the launch env and the
-  // resume snapshot agree.
-  const resolvedAgentDir =
-    localAgentDir && existsSync(localAgentDir)
-      ? localAgentDir
-      : process.env.PI_CODING_AGENT_DIR ?? null;
+  // Preserve an explicitly configured global Pi directory. Never infer it
+  // from the child's cwd; project-local resources are discovered separately.
+  const resolvedAgentDir = process.env.PI_CODING_AGENT_DIR ?? null;
 
   // Default-deny model: when an agent restricts its tools (or is granted the
   // spawning toolset), we disable global extension discovery and re-enable only
@@ -1648,6 +1712,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    // Clear a widget left by an older extension instance after /reload. A
+    // fresh module has no running children until new launches register them.
+    updateWidget();
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -1676,6 +1743,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    latestCtx?.ui.setWidget("subagent-status", undefined);
+    latestCtx = null;
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -2006,6 +2075,51 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
 
+  // ── cancellation tools ──
+  pi.registerTool({
+    name: "subagent_cancel",
+    label: "Cancel Subagent",
+    description:
+      "Cancel one running subagent by its exact display name. This aborts its watcher, closes its Herdr tab when present, and removes its status widget entry. Finished subagents are not resumed.",
+    promptSnippet:
+      "Cancel one running subagent by exact name and clean up its Herdr tab/status entry.",
+    parameters: Type.Object({
+      name: Type.String({ description: "Exact display name of the running subagent to cancel." }),
+    }),
+    async execute(_toolCallId, params) {
+      const resolved = resolveRunningByName(params.name ?? "");
+      if ("error" in resolved) {
+        return {
+          content: [{ type: "text" as const, text: resolved.error }],
+          details: { error: resolved.error },
+        };
+      }
+      const result = cancelRunningSubagent(resolved.running);
+      return {
+        content: [{ type: "text" as const, text: `Cancelled subagent "${result.name}".` }],
+        details: { name: result.name, status: "cancelled", surfaceClosed: result.surfaceClosed },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_cancel_all",
+    label: "Cancel All Subagents",
+    description:
+      "Cancel every running subagent, close any remaining Herdr tabs, and clear the subagent status widget.",
+    promptSnippet: "Cancel all running subagents and clear their Herdr tabs/status entries.",
+    parameters: Type.Object({}),
+    async execute() {
+      const names = cancelAllRunningSubagents();
+      const text = names.length > 0
+        ? `Cancelled ${names.length} subagent(s): ${names.join(", ")}.`
+        : "No subagents are currently running.";
+      return {
+        content: [{ type: "text" as const, text }],
+        details: { names, status: "cancelled" },
+      };
+    },
+  });
 
   // ── subagent_message tool ──
   pi.registerTool({

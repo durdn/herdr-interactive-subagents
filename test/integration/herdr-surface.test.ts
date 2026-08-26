@@ -11,6 +11,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
+import { pollForExit } from "../../pi-extension/subagents/herdr.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -97,6 +98,20 @@ for (const backend of backends) {
 
       closeSurface(surface);
       untrackSurface(env, surface);
+    });
+
+    it("detects a subagent tab closed outside the watcher", async () => {
+      const surface = createTrackedSurface(env, "external-close-test");
+      await sleep(1000);
+
+      const completion = pollForExit(surface, new AbortController().signal, { interval: 100 });
+      closeSurface(surface);
+      untrackSurface(env, surface);
+
+      const result = await completion;
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage ?? "", /closed externally/);
     });
 
     it("preserves shell special characters in echo output", async () => {

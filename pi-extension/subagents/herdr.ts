@@ -298,7 +298,16 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+function isPaneNotFoundError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { message?: unknown; stdout?: unknown; stderr?: unknown };
+  const text = [candidate.message, candidate.stdout, candidate.stderr]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+  return /pane_not_found|pane\s+[^\s]+\s+not found/i.test(text);
+}
+
+export const __pollForExitTest__ = { interpretExitSidecar, isPaneNotFoundError };
 
 /**
  * Poll until the subagent exits. Pi's lifecycle sidecars provide the fast path;
@@ -340,7 +349,7 @@ export async function pollForExit(
       const screen = await readScreenAsync(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) return { reason: "sentinel", exitCode: Number.parseInt(match[1], 10) };
-    } catch {
+    } catch (error) {
       if (options.sessionFile) {
         try {
           const exitFile = `${options.sessionFile}.exit`;
@@ -350,6 +359,13 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      if (isPaneNotFoundError(error)) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage: "Subagent Herdr pane was closed externally.",
+        };
       }
     }
 

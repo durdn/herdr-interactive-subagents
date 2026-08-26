@@ -64,9 +64,14 @@ Run by hand in workspace `wJ`. Every gate passed.
 - **Parent session names drift.** Claude Code renamed the orchestrator mid-session from `cfg-69`
   to a topic-derived name. Never bake a parent name into a child. The child replies to the
   `from` address carried on the incoming message.
-- **Deliver the task by message, not as a CLI prompt.** A task passed as `claude "<task>"` arrives
-  with no reply address. Spawn an idle, role-configured child and send the task with
-  `SendMessage` — the address travels with it, and `notify_when_idle` can ride along.
+- **A task needs a reply address, not necessarily a message.** The original reading of this was
+  that `claude "<task>"` arrives with no address, so the task had to come over `SendMessage`.
+  Half right: the address is what matters, and it does not have to travel on a message. The
+  orchestrator's own inbox is in `CLAUDE_CODE_MESSAGING_SOCKET`, and `SendMessage` accepts that
+  raw `uds:\\.\pipe\...` string as `to` — the same value a child copies out of an incoming
+  message's `from`. Writing it into a task brief the child reads at startup delivers task and
+  address together, and collapses spawn-then-message into one call. `SendMessage` is still the
+  channel for everything after the launch: steering, answers, follow-ups.
 - **New Herdr tabs run Windows PowerShell 5.1** (`$PSEdition = Desktop`). Prefer `--agent <role>`
   over long quoted `--append-system-prompt` arguments so nothing depends on shell quoting.
 - **Permission class governs delivery, but `acceptEdits` is the wrong default.** It auto-accepts
@@ -90,7 +95,10 @@ registry key. Herdr constrains it to `[a-z][a-z0-9_-]{0,31}`.
    --session-id <uuid> --permission-mode auto [--model <m>]`.
 4. Record ownership in `~/.claude/herdr-subagents/<parent-session-id>/registry.json`.
 5. Return the handle. Never block.
-6. The orchestrator sends the task with `SendMessage`, with `notify_when_idle: true`.
+6. With `--task`: the task is written to `<registry dir>/briefs/<name>.md` alongside the reply
+   address, that directory is granted with `--add-dir`, and the child is seeded with a one-line
+   positional prompt telling it to read the brief. Without `--task`: the child stays idle and the
+   orchestrator sends the task with `SendMessage`, with `notify_when_idle: true`.
 
 Every role body ends with the same reply contract: report the final summary to the sender of the
 task by `SendMessage`; if one decision materially blocks the work, send the question and stop
@@ -130,6 +138,20 @@ rather than guessing.
   4.6/Sonnet 4.6 (no `xhigh`). Read the effort back from the child's session header
   (`Sonnet 5 with low effort`), which is the only place it is visible - it is absent from the
   transcript, and `CLAUDE_EFFORT` is not exported in every session.
+- **A trailing positional prompt is swallowed by the preceding flag.** `claude`'s `--add-dir`,
+  `--allowed-tools`, `--mcp-config` and friends are variadic, so `--add-dir <dir> "<prompt>"`
+  parses the prompt as a second directory. The child then boots to an idle prompt with no task and
+  no error, which is indistinguishable from a child still thinking — the failure mode is silence,
+  not a message. The seed prompt goes first, before any flag.
+- **The seed prompt must stay out of the recorded argv.** `resume` replays argv; a replayed seed
+  would re-run the finished task on the revived child.
+- **A skill loaded from `~/.claude/skills` cannot locate its own plugin.** `CLAUDE_PLUGIN_ROOT`
+  is unset there, and the entry is a junction, so a relative `../../scripts/hs.mjs` in SKILL.md
+  normalises lexically to `~/.claude/scripts/hs.mjs` before the filesystem ever sees it. Every
+  reader then spends three or four tool calls hunting for the script. `install` now writes a
+  forwarding shim at the fixed path `~/.claude/herdr-subagents/hs.mjs`, which SKILL.md names
+  verbatim: stable, machine-independent, and correct under `~` expansion in both shells. `spawn`
+  rewrites it when stale, so a moved checkout self-heals without an install.
 - **The transcript's last assistant text is not the result.** A child that reports correctly does
   so with a `SendMessage` tool call and often prints something afterwards. `hs.mjs result` returns
   the last `SendMessage` argument when there is one, and falls back to the last text.

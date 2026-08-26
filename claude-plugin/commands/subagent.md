@@ -6,21 +6,24 @@ allowed-tools: Bash, SendMessage, Read
 
 Delegate `$ARGUMENTS` to a subagent running in its own background Herdr tab.
 
-The first word is the role (`scout`, `researcher`, `worker`, `reviewer`, or any role
-`hs.mjs roles` lists). The rest is the task.
+The first word is the role (`scout`, `researcher`, `worker`, `reviewer`, or any role defined in
+`.claude/agents/`). The rest is the task. If no role is given, pick the one that fits and say
+which you chose.
 
-Follow the `herdr-subagents` skill. In short:
+Launch it in a single call. No `doctor`, no `roles`, no hunting for the script — that path below
+is correct as written, on any machine:
 
-1. Spawn it, with `--cwd` set to the directory the task is about (a trusted one) and
-   `--add-dir` for anything outside it:
+```bash
+node ~/.claude/herdr-subagents/hs.mjs spawn --role <role> --cwd "<dir the task is about>" \
+  --task "<the task, restated in full>"
+```
 
-   ```bash
-   node "<plugin>/scripts/hs.mjs" spawn --role <role> --cwd "<dir>"
-   ```
+- `--cwd` must be a directory Claude Code already trusts; add `--add-dir <path>` for anything
+  outside it, once per directory.
+- Restate the task in full, including whatever it depends on from this conversation — the child
+  inherits none of it — and say what shape you want the answer in.
+- Then tell the user what you dispatched and which tab it landed in. Do not poll; the result
+  arrives on its own as a message.
 
-2. Send the task to the returned handle with `SendMessage`, `notify_when_idle: true`. Restate
-   everything the child needs — it inherits none of this conversation.
-3. Tell the user what you dispatched and which tab it is in. Do not poll for the result; it
-   arrives on its own.
-
-If no role is given, pick the one that fits the task and say which you chose.
+The `herdr-subagents` skill covers steering, blocked children, recovering a lost result, and
+cleanup.

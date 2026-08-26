@@ -6,7 +6,7 @@ allowed-tools: Bash
 List the children this session owns and their live Herdr state:
 
 ```bash
-node "<plugin>/scripts/hs.mjs" list
+node ~/.claude/herdr-subagents/hs.mjs list
 ```
 
 Report each one's handle, role, status, and tab. For anything showing `blocked`, inspect it

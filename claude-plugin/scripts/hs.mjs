@@ -5,7 +5,7 @@
 // service: Claude Code's own SendMessage/ListAgents and Herdr's agent lifecycle
 // already provide those. See docs/claude-orchestrator.md.
 //
-//   node scripts/hs.mjs spawn --role scout [--name n] [--cwd p] [--model m]
+//   node scripts/hs.mjs spawn --role scout --cwd p --task "..." [--name n] [--model m]
 //   node scripts/hs.mjs list [--json]
 //   node scripts/hs.mjs result <name> [--lines N]
 //   node scripts/hs.mjs resume <name>
@@ -131,6 +131,65 @@ function isTrustedCwd(cwd) {
 
 function parentSessionId() {
   return process.env.CLAUDE_CODE_SESSION_ID || "unknown-parent";
+}
+
+/** This session's own inbox. A child copies it verbatim as SendMessage's `to`. */
+function replyAddress() {
+  return (process.env.CLAUDE_CODE_MESSAGING_SOCKET || "").trim();
+}
+
+/** Windows separators do not survive two layers of shell quoting; slashes do. */
+function fwd(p) {
+  return p.split("\\").join("/");
+}
+
+function briefsDir() {
+  return join(homedir(), ".claude", "herdr-subagents", parentSessionId(), "briefs");
+}
+
+function taskText(opts) {
+  if (opts.task === true || opts.taskFile === true) die("--task/--task-file need a value");
+  if (opts.task && opts.taskFile) die("pass --task or --task-file, not both");
+  if (opts.taskFile) {
+    const p = resolve(opts.taskFile);
+    if (!existsSync(p)) die("--task-file does not exist: " + p);
+    return readFileSync(p, "utf8").trim();
+  }
+  const t = [].concat(opts.task || []).filter((x) => typeof x === "string").join("\n").trim();
+  return t || null;
+}
+
+/**
+ * Hand the task over as a file rather than as argv. Herdr starts a child by
+ * typing its command line into the pane's shell, so a task passed inline has to
+ * survive two quoting layers and cannot contain a newline at all. A path can.
+ * The brief also carries the reply address, which is the other half of what a
+ * task message used to supply.
+ */
+function writeBrief(name, task) {
+  const dir = briefsDir();
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name + ".md");
+  writeFileSync(path, [
+    "# Task brief",
+    "",
+    "You are a background subagent in a Herdr tab. Your plain text output is not",
+    "visible to the orchestrator that assigned this - it only ever sees what you",
+    "send it.",
+    "",
+    "Reply address: " + replyAddress(),
+    "",
+    "When you are done, call SendMessage with that address copied verbatim as `to`.",
+    "Send exactly one message: your result. If one decision materially blocks you,",
+    "send that question instead and stop - the answer arrives as your next turn.",
+    "Never send progress chatter.",
+    "",
+    "## The task",
+    "",
+    task,
+    "",
+  ].join("\n"));
+  return path;
 }
 
 // -- registry --------------------------------------------------------------
@@ -308,6 +367,8 @@ function extraDirs(opts, role) {
 
 function cmdSpawn(opts) {
   requireHerdr();
+  // Keep the address SKILL.md names in step with this checkout, without an install.
+  try { writeShim({ quiet: true }); } catch { /* not fatal; spawning still works */ }
   if (!opts.role) die("spawn needs --role <name> (see: hs.mjs roles)");
   const role = requireRole(opts.role);
 
@@ -371,7 +432,33 @@ function cmdSpawn(opts) {
   // blocks on an approval prompt the orchestrator must not answer for the user.
   for (const dir of extraDirs(opts, role)) childArgs.push("--add-dir", dir);
 
-  const started = startAgentInPane(name, paneId, childArgs);
+  const task = taskText(opts);
+  let briefPath = null;
+  if (task) {
+    if (!replyAddress()) {
+      die([
+        "--task needs this session's messaging inbox, and CLAUDE_CODE_MESSAGING_SOCKET is unset,",
+        "    so the child would have nowhere to report. Spawn without --task and send the task",
+        "    with SendMessage instead.",
+      ].join("\n"));
+    }
+    briefPath = writeBrief(name, task);
+    // The brief lives outside cwd, so the child needs it granted or it stalls on
+    // a permission prompt before it has read one word of the task.
+    childArgs.push("--add-dir", briefsDir());
+  }
+
+  // The seed prompt is deliberately NOT part of the recorded argv: resume replays
+  // argv, and replaying a seed would re-run the whole task on a finished child.
+  //
+  // It goes FIRST, before any flag. Claude Code's --add-dir, --allowed-tools and
+  // friends are variadic, so a trailing positional is swallowed as one more value
+  // for whichever of them came last: the child then boots into an idle prompt with
+  // no task and no error, which looks exactly like a child that is still thinking.
+  const seed = briefPath
+    ? ["Read " + fwd(briefPath) + " and carry out the task brief it contains."]
+    : [];
+  const started = startAgentInPane(name, paneId, [...seed, ...childArgs]);
   const agent = started?.result?.agent;
   if (!agent) {
     // Herdr keeps the name readable after agent_not_ready; capture the screen
@@ -405,8 +492,11 @@ function cmdSpawn(opts) {
 
   console.log(JSON.stringify({
     ...entry,
+    brief: briefPath,
     status: agent.agent_status,
-    next: `Send the task with SendMessage to "${name}" (add notify_when_idle: true).`,
+    next: briefPath
+      ? `task delivered; "${name}" reports back on its own as a cross-session message. Do not poll.`
+      : `idle - send the task with SendMessage to "${name}" (add notify_when_idle: true).`,
   }, null, 2));
 }
 
@@ -522,6 +612,44 @@ function cmdRoles() {
   }
 }
 
+function shimPath() {
+  return join(homedir(), ".claude", "herdr-subagents", "hs.mjs");
+}
+
+/**
+ * SKILL.md has to name a path that a model can run verbatim, on any machine,
+ * with no lookup step first. It cannot name this checkout (machine-specific)
+ * and it cannot resolve its own location: the skill loads from ~/.claude/skills
+ * where CLAUDE_PLUGIN_ROOT is unset, and that entry is a junction whose ".."
+ * resolves lexically to ~/.claude rather than to the plugin. A fixed shim under
+ * $HOME is the only address that is both stable and portable.
+ */
+function shimBody() {
+  const target = fwd(join(PLUGIN_DIR, "scripts", "hs.mjs"));
+  return [
+    "#!/usr/bin/env node",
+    "// Generated by 'hs.mjs install' - do not edit. Forwards to the plugin checkout.",
+    'import { existsSync } from "node:fs";',
+    "const target = " + JSON.stringify(target) + ";",
+    "if (!existsSync(target)) {",
+    '  console.error("hs: plugin gone from " + target + " - re-run install from the plugin checkout");',
+    "  process.exit(1);",
+    "}",
+    'await import("file:///" + target);',
+    "",
+  ].join("\n");
+}
+
+function writeShim({ quiet = false } = {}) {
+  const p = shimPath();
+  const body = shimBody();
+  if (existsSync(p) && readFileSync(p, "utf8") === body) return false;
+  mkdirSync(join(p, ".."), { recursive: true });
+  writeFileSync(p, body);
+  if (!quiet) console.log("shim: " + p + " -> " + fwd(join(PLUGIN_DIR, "scripts", "hs.mjs")));
+  return true;
+}
+
 /**
  * A plugin directory under ~/.claude/skills/<name> auto-loads for every session
  * as <name>@skills-dir, so a link there is the whole install.
@@ -605,6 +733,7 @@ function cmdInstall() {
     symlinkSync(want, link, process.platform === "win32" ? "junction" : "dir");
     console.log(`installed: ${link} -> ${want}`);
   }
+  if (!writeShim()) console.log(`shim: ${shimPath()} (already current)`);
   const deployed = deployCommands();
   console.log(deployed.length ? `commands: ${deployed.map((d) => `/${d}`).join(" ")}` : "commands: none");
   console.log("Restart Claude Code to pick up the skill and commands.");
@@ -619,6 +748,10 @@ function cmdUninstall() {
   if (!linkTarget(link) && !lstatSync(link).isDirectory()) die(`${link} is not a link we created`);
   rmSync(link, { recursive: false, force: true });
   console.log(`removed ${link}`);
+  if (existsSync(shimPath())) {
+    rmSync(shimPath(), { force: true });
+    console.log(`removed ${shimPath()}`);
+  }
   for (const c of commandTargets()) {
     if (existsSync(c.dest) && readFileSync(c.dest, "utf8").includes(COMMAND_MARKER)) {
       rmSync(c.dest, { force: true });
@@ -661,6 +794,13 @@ function cmdDoctor() {
       ? `skill loadable at ${installLink()}`
       : "skill NOT loadable by the orchestrator (run: hs.mjs install) - spawning still works"}`,
   );
+  const shimCurrent = existsSync(shimPath()) && readFileSync(shimPath(), "utf8") === shimBody();
+  console.log(
+    `${shimCurrent ? "ok  " : "note"}  ${shimCurrent
+      ? `shim current (${shimPath()})`
+      : `shim stale or missing at ${shimPath()} (spawn rewrites it; or run: hs.mjs install)`}`,
+  );
+  check(Boolean(replyAddress()), "children can address this session (reply address set)");
   const missing = commandTargets().filter((c) => !existsSync(c.dest)).map((c) => c.name);
   console.log(
     `${missing.length ? "note" : "ok  "}  ${missing.length

@@ -13,153 +13,163 @@ Use this instead of the Task tool when the user wants to *see* the work happen, 
 by hand, or keep a child alive across several exchanges. Use the Task tool when you just want a
 result and nobody needs to watch — it is cheaper and has no tabs to clean up.
 
-The script referenced below is `${CLAUDE_PLUGIN_ROOT}/scripts/hs.mjs`. If that variable is not
-set, it sits two directories up from this file, at `<plugin>/scripts/hs.mjs`.
-
-## Before spawning anything
+## Spawning, in one call
 
 ```bash
-node "$HS" doctor        # HS = <plugin>/scripts/hs.mjs
+node ~/.claude/herdr-subagents/hs.mjs spawn --role scout --cwd "<dir the task is about>" \
+  --task "<the entire task, as many lines as you need>"
 ```
 
-It checks that you are inside Herdr, that this Claude Code can send and receive cross-session
-messages, and that the roles parse. If it fails, say so and stop — none of the rest works without
-it.
+That is the whole launch. It creates the tab, starts the child, hands it the task, and tells it
+where to reply — then returns immediately without blocking. The result arrives on its own as a
+`<cross-session-message>` and starts a new turn here.
 
-## The loop
+`node ~/.claude/herdr-subagents/hs.mjs` is the address on every machine. Run it verbatim. Do not
+search for the script, resolve a plugin root, or read `$CLAUDE_PLUGIN_ROOT` — this skill loads
+from `~/.claude/skills`, where that variable is unset and the directory is a link whose `..`
+resolves somewhere else entirely.
 
-**1. Spawn.** Returns immediately with a handle; it never blocks.
+**Do not run anything before the spawn.** No `doctor`, no `roles`, no probing. `spawn` checks its
+own preconditions, and every failure it can hit prints what to do about it. `doctor` is for after
+something breaks, not before.
+
+**Fan out by putting every spawn in ONE Bash call**, one line each, each with its own `--name`:
 
 ```bash
-node "$HS" spawn --role scout --cwd "<the directory the task is about>"
+HS=~/.claude/herdr-subagents/hs.mjs
+node $HS spawn --role scout      --name auth-scout --cwd "$PWD" --task "Map how login works: ..."
+node $HS spawn --role researcher --name rfc-reader --cwd "$PWD" --task "Read RFC 6749 and ..."
+node $HS spawn --role worker     --name flake-fix  --cwd "$PWD" --task "test_x is flaky: ..."
 ```
 
-The handle in the returned JSON (`name`) is the child's Herdr tab label *and* its message
-address. Pass `--name <handle>` to choose it yourself — do that when you are spawning several and
-want to tell them apart later (`auth-scout`, `perf-scout`). Add `--model <alias>` for a cheaper
-child, and `--add-dir <path>` for each directory outside `--cwd` the child may read.
+Three to five is the useful range. Each is a separate session with its own token cost, and past
+that the coordination costs more than the parallelism buys. Give each a task that does not touch
+another's files.
 
-**2. Send the task with `SendMessage`, not on the command line.** The spawn leaves the child idle
-on purpose. The task must arrive as a message so the child receives your reply address with it.
+## Writing the `--task`
+
+The child inherits **nothing** — not one word of this conversation, no file path you have been
+discussing, no decision already made, no earlier turn. Restate all of it. A task that reads fine
+to you and mentions "the config we looked at" reaches a child that has never seen it.
+
+Say what you want back, too. The child's reply is a message to you, not a report for the user, so
+ask for the shape you can actually use: paths with line numbers, a diff summary, a verdict.
+
+Newlines and quotes are fine — the task travels as a file, not on a command line.
+
+## Roles
+
+| Role | For | Model | Effort |
+| --- | --- | --- | --- |
+| `scout` | Read-only recon: locate code, map structure, report paths and line numbers | sonnet | low |
+| `researcher` | External research; reads the web, cites what it used | sonnet | medium |
+| `worker` | Implementation: reads, edits, runs commands, reports what changed | sonnet | high |
+| `reviewer` | Reviews a change and returns findings; fixes nothing | opus | high |
+
+This table is the list — do not run `roles` to re-read it. Each role carries its own tool
+allowlist, so a `scout` cannot write files no matter what the task says, and its own model and
+effort, so recon is not billed like review. A child inherits neither the model nor the effort of
+this session; `--model` and `--effort` at spawn override the role. Raise effort for a genuinely
+hard task, not by reflex — and note that Haiku ignores effort entirely.
+
+A project can add roles in `.claude/agents/` and a user in `~/.claude/agents/`; both shadow the
+bundled ones by name. `spawn` names the roles it knows when you ask for one it does not have, so
+even then you never need a lookup step first.
+
+## Choosing the working directory
+
+`--cwd` must be a directory Claude Code already trusts, or the child stalls at startup on the
+trust dialog. `spawn` checks this and refuses rather than stranding a tab. The safe default is the
+directory you are working in now; reach anywhere else with `--add-dir <path>`, once per directory.
+A child that hits a path outside both shows up as `blocked`, waiting on a permission prompt.
+
+## Steering, questions, and blocked children
+
+Everything after the spawn goes through `SendMessage`, addressed to the handle. It is a deferred
+tool, so when you already know you will need it — you are answering a question, or steering — put
+`ToolSearch("select:SendMessage")` in the same block as the spawn rather than in a round trip of
+its own.
+
+**To steer a running child**: `SendMessage({ to: "<handle>", message: "..." })`. It reads the
+message between tool calls without losing its place.
+
+**When a child asks you something**, it has stopped and is waiting. Answer with `SendMessage` and
+it picks straight up. If the question is genuinely the user's to answer, ask the user — do not
+invent an answer on the child's behalf.
+
+**When `hs.mjs list` shows a child `blocked`**, Herdr has spotted an approval or question dialog:
+
+```bash
+node ~/.claude/herdr-subagents/hs.mjs list
+herdr agent read <handle> --source detection --lines 40
+```
+
+Tell the user what is being asked and let them decide, or stop the child and respawn it with the
+access it needed. Never answer that dialog for them with `herdr agent send-keys`.
+
+## While you wait
+
+Do not poll, do not loop on `list`, do not send "are you done?". Tell the user what you dispatched
+and get on with something else. Results arrive independently and in any order — handle each as it
+lands rather than waiting for the set.
+
+If one never arrives, the child's transcript is the authority:
+
+```bash
+node ~/.claude/herdr-subagents/hs.mjs result <handle>
+```
+
+That returns the message it reported, or its last words if it never reported one. `herdr agent
+read` only shows what is still on screen, so use that to diagnose a stuck child, not to recover a
+finished answer.
+
+## Reporting and cleanup
+
+Relay what the child found — the user sees its message go past, but not as your result, and never
+with your read of it. Then close the tab:
+
+```bash
+node ~/.claude/herdr-subagents/hs.mjs stop <handle>      # or: stop-all
+```
+
+Only ever stop children this session spawned; the script refuses the rest. Stopping closes the tab
+but not the Claude session, so a finished child can come back with its full history, in a new tab,
+for a follow-up:
+
+```bash
+node ~/.claude/herdr-subagents/hs.mjs resume <handle>
+```
+
+Then message it as before, instead of spawning a fresh one that knows nothing. `forget <handle>`
+drops a stopped child from the registry for good.
+
+## The two-step form
+
+`spawn` without `--task` leaves the child idle, and the task goes over as a message instead:
 
 ```
 SendMessage({ to: "<handle>", message: "<the whole task>", notify_when_idle: true })
 ```
 
-Put everything the child needs in that message. It does not inherit one word of this
-conversation — no file paths you have been discussing, no decisions already made, no context from
-earlier turns.
-
-`notify_when_idle: true` is a backstop, not the result channel: it fires once when the child next
-goes idle or exits, so you still hear about a child that died without answering. Expect it to be
-late - it lands at your own turn boundary and can arrive long after the child actually finished.
-The child's own reply is what arrives promptly.
-
-**3. Carry on.** Do not poll, do not loop on `hs list`, do not send "are you done?". The result
-arrives on its own as a `<cross-session-message>` and starts a new turn here. Work on something
-else, or tell the user what you dispatched and wait.
-
-**4. Report and clean up.** Relay what the child found — the user cannot see its message as a
-result, only as a message. Then close the tab:
-
-```bash
-node "$HS" stop <handle>          # or: stop-all
-```
-
-Only ever stop children this session spawned. The script refuses the rest.
-
-## Roles
-
-```bash
-node "$HS" roles
-```
-
-| Role | What it is for |
-| --- | --- |
-| `scout` | Read-only recon: locate code, map structure, report paths and line numbers |
-| `researcher` | External research with sources; reads the web, cites what it used |
-| `worker` | Implementation: reads, edits, runs commands, reports what changed |
-| `reviewer` | Reviews a change and returns findings; fixes nothing |
-
-Each role carries its own tool allowlist, so a `scout` cannot write files no matter what the task
-says, and its own model and effort, so recon is not billed like review:
-
-| Role | Model | Effort |
-| --- | --- | --- |
-| `scout` | sonnet | low |
-| `researcher` | sonnet | medium |
-| `worker` | sonnet | high |
-| `reviewer` | opus | high |
-
-A child inherits neither the model nor the effort of this session - it is a separate session, not
-a teammate - so the role decides, and `--model` / `--effort` at spawn override it. Raise the effort
-for a genuinely hard task; do not raise it by reflex. Note that Haiku does not support effort at
-all, so `--model haiku --effort high` silently gets you no extra reasoning. Project roles in `.claude/agents/` and user roles in `~/.claude/agents/` are picked up too,
-and shadow the bundled ones by name.
-
-## Choosing the working directory
-
-`--cwd` must be a directory Claude Code already trusts, or the child stalls at startup on the
-trust dialog. The script checks this and refuses rather than stranding a tab. The safe default is
-the directory you are working in now; reach anywhere else with `--add-dir`. A child that hits a
-path outside both shows up as `blocked`, waiting on a permission prompt.
-
-## Fan-out
-
-Spawn each child, then send each its task. Three to five is the useful range; each one is a
-separate Claude Code session with its own token cost, and past that the coordination costs more
-than the parallelism buys.
-
-Give each a distinct handle and a task that does not overlap another's files. Their results
-arrive independently and in any order — handle each as it lands rather than waiting for a set.
-
-## Steering, questions, and blocked children
-
-**To steer a running child**, message it: `SendMessage({ to: "<handle>", message: "..." })`. It
-reads the message between tool calls without losing its place.
-
-**When a child asks you something**, it has stopped and is waiting. Answer with `SendMessage` and
-it picks straight up. If the question is genuinely the user's to answer, ask the user first — do
-not invent an answer on the child's behalf.
-
-**When `hs list` shows a child `blocked`**, Herdr has spotted an approval or question dialog.
-Look, then surface it:
-
-```bash
-node "$HS" list
-herdr agent read <handle> --source detection --lines 40
-```
-
-Never answer that dialog for the user with `herdr agent send-keys`. Tell them what is being asked
-and let them decide, or cancel the child and respawn it with the access it needed.
-
-## When a result never arrives
-
-The child's transcript is the authority. This returns the message it reported, or its last
-words if it never reported one:
-
-```bash
-node "$HS" result <handle>
-```
-
-`herdr agent read` only shows what is still on screen, so use it to diagnose a stuck child, not to
-recover a finished answer.
-
-## Resuming
-
-Stopping a child closes its tab but not its Claude session, so it stays resumable. Bring it back
-with its full history, in a new tab:
-
-```bash
-node "$HS" resume <handle>
-```
-
-Then message it as before. Use this when a finished child needs a follow-up, instead of spawning a
-fresh one that knows nothing. `node "$HS" forget <handle>` drops a stopped child from the registry
-for good.
+Reach for this only when the task is not settled at spawn time — you are about to ask the user
+something first, or the child is a standing worker you will feed repeatedly. Otherwise it costs a
+round trip and gains nothing. `notify_when_idle` is a backstop, not the result channel: it fires
+once when the child next goes idle or exits, so you still hear about one that died without
+answering. Expect it late; it lands at your own turn boundary. The child's own reply is what
+arrives promptly.
 
 ## Costs and limits
 
 Every child is a full session billed on its own. Delegate work that is genuinely separable and
 large enough to be worth a whole context window; do the small stuff yourself. Children cannot
 spawn children through this skill, and a child never inherits your conversation.
+
+## When something is actually broken
+
+```bash
+node ~/.claude/herdr-subagents/hs.mjs doctor
+```
+
+Checks that you are inside Herdr, that this Claude Code can send and receive cross-session
+messages, that children have an address to answer on, and that the roles parse. Run it when a
+spawn fails or a child never reports — not as a warm-up.

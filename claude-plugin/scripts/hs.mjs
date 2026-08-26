@@ -31,7 +31,11 @@ const ROLE_DIRS = [
   join(homedir(), ".claude", "agents"),
   join(PLUGIN_DIR, "agents"),
 ];
+// A new pane is not an available shell until its shell reaches the prompt, and
+// Herdr rejects `agent start` with agent_pane_busy until it is. These bound the
+// retry in startAgentInPane; they are not a guess at how long that takes.
 const SHELL_READY_MS = Number(process.env.HS_SHELL_READY_DELAY_MS || 600);
+const SHELL_READY_TIMEOUT_MS = Number(process.env.HS_SHELL_READY_TIMEOUT_MS || 30000);
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
 // -- shell out -------------------------------------------------------------
@@ -68,6 +72,25 @@ function die(message) {
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Start a child in a pane that may still be booting its shell. A fixed sleep
+// loses this race on a loaded box - a fresh pane here needs seconds, not the
+// 600ms it used to wait - so ask Herdr rather than guess: retry for as long as
+// it says the pane is busy, and hand any other outcome back to the caller to
+// report. agent_not_ready is NOT retried; that child started and is blocked.
+function startAgentInPane(name, paneId, agentArgs) {
+  const deadline = Date.now() + SHELL_READY_TIMEOUT_MS;
+  for (;;) {
+    sleepSync(SHELL_READY_MS);
+    const started = herdrJson(
+      ["agent", "start", name, "--kind", "claude", "--pane", paneId, "--timeout", "60000",
+        "--", ...agentArgs],
+      { allowFailure: true },
+    );
+    if (started?.result?.agent) return started;
+    if (started?.error?.code !== "agent_pane_busy" || Date.now() >= deadline) return started;
+  }
 }
 
 // -- context ---------------------------------------------------------------
@@ -318,9 +341,6 @@ function cmdSpawn(opts) {
   const paneId = created?.result?.root_pane?.pane_id;
   if (!paneId) die(`Herdr did not return a root pane: ${JSON.stringify(created)}`);
 
-  // The pane's shell must reach its prompt before an agent can start in it.
-  sleepSync(SHELL_READY_MS);
-
   const sessionId = crypto.randomUUID();
   const model = opts.model || role.model || null;
   // A child is an ordinary session, not a teammate: it does not inherit the
@@ -347,10 +367,7 @@ function cmdSpawn(opts) {
   // blocks on an approval prompt the orchestrator must not answer for the user.
   for (const dir of extraDirs(opts, role)) childArgs.push("--add-dir", dir);
 
-  const started = herdrJson(
-    ["agent", "start", name, "--kind", "claude", "--pane", paneId, "--timeout", "60000", "--", ...childArgs],
-    { allowFailure: true },
-  );
+  const started = startAgentInPane(name, paneId, childArgs);
   const agent = started?.result?.agent;
   if (!agent) {
     // Herdr keeps the name readable after agent_not_ready; capture the screen
@@ -449,18 +466,13 @@ function cmdResume(name) {
   const tabId = created?.result?.tab?.tab_id;
   const paneId = created?.result?.root_pane?.pane_id;
   if (!paneId) die(`Herdr did not return a root pane: ${JSON.stringify(created)}`);
-  sleepSync(SHELL_READY_MS);
 
   // Replay the recorded loadout, swapping the fresh-session flag for a resume.
   const childArgs = entry.argv.filter((a, i, all) => {
     if (a === "--session-id") return false;
     return all[i - 1] !== "--session-id";
   });
-  const started = herdrJson(
-    ["agent", "start", name, "--kind", "claude", "--pane", paneId, "--timeout", "60000",
-      "--", "--resume", entry.sessionId, ...childArgs],
-    { allowFailure: true },
-  );
+  const started = startAgentInPane(name, paneId, ["--resume", entry.sessionId, ...childArgs]);
   if (!started?.result?.agent) {
     herdr(["tab", "close", tabId], { allowFailure: true });
     die(`could not resume '${name}'. Response: ${JSON.stringify(started)}`);

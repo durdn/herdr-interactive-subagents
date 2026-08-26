@@ -354,7 +354,11 @@ function cmdSpawn(opts) {
   const childArgs = [
     "--name", name,
     "--session-id", sessionId,
-    "--permission-mode", opts.permissionMode || role["permission-mode"] || "acceptEdits",
+    // auto, not acceptEdits: acceptEdits still stops the child dead on every Bash
+    // and WebFetch approval, and a background tab nobody is watching just sits
+    // there. bypassPermissions is NOT the alternative - a child in that class has
+    // every message it sends held for the user's approval, which breaks reporting.
+    "--permission-mode", opts.permissionMode || role["permission-mode"] || "auto",
     // The role carries the identity, the tool allowlist, and the reply contract,
     // so nothing long or quoted has to survive the pane's shell.
     "--agent", role.name,

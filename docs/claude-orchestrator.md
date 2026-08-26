@@ -69,10 +69,13 @@ Run by hand in workspace `wJ`. Every gate passed.
   `SendMessage` — the address travels with it, and `notify_when_idle` can ride along.
 - **New Herdr tabs run Windows PowerShell 5.1** (`$PSEdition = Desktop`). Prefer `--agent <role>`
   over long quoted `--append-system-prompt` arguments so nothing depends on shell quoting.
-- **Permission class governs delivery.** `acceptEdits` children sit in the "prompting" class, so
-  their messages to an `auto`/`acceptEdits` parent are delivered rather than held. A
-  `bypassPermissions` child would have every message held for approval — a second reason not to
-  use it.
+- **Permission class governs delivery, but `acceptEdits` is the wrong default.** It auto-accepts
+  edits and then stops the child dead on every Bash and WebFetch approval, in a background tab
+  nobody is watching — three of five children in the 2026-08-26 battery parked that way. Children
+  now default to `auto`, the same class the orchestrator runs in; a probe child under `auto` ran
+  pwsh, executed a script, listed files and did a WebFetch with no prompt, and its reply was
+  delivered normally. `bypassPermissions` is NOT the alternative: a child in that class would have
+  every message it sends held for approval, which breaks reporting outright.
 - **`herdr agent list` already carries each agent's claude session id**, so the registry only has
   to record which children *this* orchestrator owns, and with which role.
 
@@ -84,7 +87,7 @@ registry key. Herdr constrains it to `[a-z][a-z0-9_-]{0,31}`.
 1. Guard `HERDR_ENV=1`, read `HERDR_WORKSPACE_ID`.
 2. `herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd <cwd> --label <name> --no-focus`.
 3. `herdr agent start <name> --kind claude --pane <root pane> -- --agent <role> --name <name>
-   --session-id <uuid> --permission-mode acceptEdits [--model <m>]`.
+   --session-id <uuid> --permission-mode auto [--model <m>]`.
 4. Record ownership in `~/.claude/herdr-subagents/<parent-session-id>/registry.json`.
 5. Return the handle. Never block.
 6. The orchestrator sends the task with `SendMessage`, with `notify_when_idle: true`.

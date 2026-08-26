@@ -323,6 +323,14 @@ function cmdSpawn(opts) {
 
   const sessionId = crypto.randomUUID();
   const model = opts.model || role.model || null;
+  // A child is an ordinary session, not a teammate: it does not inherit the
+  // orchestrator's model or effort, it resolves its own from its settings and
+  // the model default. State both per role so a scout is never billed like a
+  // reviewer, and record them in argv so `resume` replays the same loadout.
+  const effort = opts.effort || role.effort || null;
+  if (effort && !["low", "medium", "high", "xhigh", "max"].includes(effort)) {
+    die(`unknown effort '${effort}' (low, medium, high, xhigh, max)`);
+  }
   const childArgs = [
     "--name", name,
     "--session-id", sessionId,
@@ -334,6 +342,7 @@ function cmdSpawn(opts) {
     "--settings", '{"crossSessionInbound":"accept"}',
   ];
   if (model) childArgs.push("--model", model);
+  if (effort) childArgs.push("--effort", effort);
   // Anything outside cwd that the child may legitimately read; without this it
   // blocks on an approval prompt the orchestrator must not answer for the user.
   for (const dir of extraDirs(opts, role)) childArgs.push("--add-dir", dir);
@@ -366,6 +375,7 @@ function cmdSpawn(opts) {
     paneId,
     workspace,
     model,
+    effort,
     parent: parentSessionId(),
     startedAt: new Date().toISOString(),
     argv: childArgs,
@@ -489,8 +499,10 @@ function cmdRoles() {
     console.log("no roles found");
     return;
   }
+  const pad = (s, n) => String(s ?? "-").padEnd(n);
+  console.log(`${pad("ROLE", 14)}${pad("MODEL", 10)}${pad("EFFORT", 8)}DESCRIPTION`);
   for (const r of roles) {
-    console.log(`${r.name.padEnd(14)}${r.model ? `[${r.model}] ` : ""}${r.description || ""}`);
+    console.log(`${pad(r.name, 14)}${pad(r.model, 10)}${pad(r.effort, 8)}${r.description || ""}`);
   }
 }
 

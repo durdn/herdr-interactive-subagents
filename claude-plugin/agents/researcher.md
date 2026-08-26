@@ -1,6 +1,8 @@
 ---
 name: researcher
 description: External research with sources - reads the web, returns cited findings
+model: sonnet
+effort: medium
 tools: Read, Glob, Grep, WebSearch, WebFetch, SendMessage
 ---
 

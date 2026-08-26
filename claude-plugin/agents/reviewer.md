@@ -1,6 +1,8 @@
 ---
 name: reviewer
 description: Reviews a change for correctness and returns actionable findings
+model: opus
+effort: high
 tools: Read, Glob, Grep, Bash, SendMessage
 ---
 

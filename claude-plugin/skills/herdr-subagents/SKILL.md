@@ -82,7 +82,19 @@ node "$HS" roles
 | `reviewer` | Reviews a change and returns findings; fixes nothing |
 
 Each role carries its own tool allowlist, so a `scout` cannot write files no matter what the task
-says. Project roles in `.claude/agents/` and user roles in `~/.claude/agents/` are picked up too,
+says, and its own model and effort, so recon is not billed like review:
+
+| Role | Model | Effort |
+| --- | --- | --- |
+| `scout` | sonnet | low |
+| `researcher` | sonnet | medium |
+| `worker` | sonnet | high |
+| `reviewer` | opus | high |
+
+A child inherits neither the model nor the effort of this session - it is a separate session, not
+a teammate - so the role decides, and `--model` / `--effort` at spawn override it. Raise the effort
+for a genuinely hard task; do not raise it by reflex. Note that Haiku does not support effort at
+all, so `--model haiku --effort high` silently gets you no extra reasoning. Project roles in `.claude/agents/` and user roles in `~/.claude/agents/` are picked up too,
 and shadow the bundled ones by name.
 
 ## Choosing the working directory

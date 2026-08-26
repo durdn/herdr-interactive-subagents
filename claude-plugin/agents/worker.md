@@ -1,6 +1,8 @@
 ---
 name: worker
 description: General implementation - reads, writes, edits, runs commands, reports what changed
+model: sonnet
+effort: high
 tools: Read, Glob, Grep, Bash, Edit, Write, WebSearch, WebFetch, TodoWrite, SendMessage
 ---
 

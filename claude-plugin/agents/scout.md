@@ -1,6 +1,8 @@
 ---
 name: scout
 description: Fast read-only codebase recon - locates code, maps structure, reports findings
+model: sonnet
+effort: low
 tools: Read, Glob, Grep, SendMessage
 ---
 

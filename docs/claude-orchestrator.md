@@ -115,6 +115,18 @@ rather than guessing.
   a backstop that says a child finished or died, and it may be stale when it lands. It does report
   an exit (`has exited before going idle`), which is how a dead child is distinguished from a slow
   one.
+- **A child inherits neither the orchestrator's model nor its effort.** It is an ordinary session,
+  not a teammate, so it resolves its own: `--model` if given else the account default, and effort
+  by the documented precedence (`CLAUDE_CODE_EFFORT_LEVEL` > the configured `effortLevel` > the
+  model default of `high`). On this machine that meant every child read `effortLevel: xhigh` from
+  user settings and came up as `Sonnet 5 with xhigh effort` - a scout running a grep billed at the
+  deepest setting. Roles now state `model:` and `effort:` themselves, and both go into the
+  recorded argv so `resume` replays the same loadout.
+- **Haiku 4.5 does not support effort**, so `--effort` is accepted and silently inert there. The
+  effort-capable models are Fable 5, Opus 5, Sonnet 5, Opus 4.8/4.7 (`low`-`max`) and Opus
+  4.6/Sonnet 4.6 (no `xhigh`). Read the effort back from the child's session header
+  (`Sonnet 5 with low effort`), which is the only place it is visible - it is absent from the
+  transcript, and `CLAUDE_EFFORT` is not exported in every session.
 - **The transcript's last assistant text is not the result.** A child that reports correctly does
   so with a `SendMessage` tool call and often prints something afterwards. `hs.mjs result` returns
   the last `SendMessage` argument when there is one, and falls back to the last text.

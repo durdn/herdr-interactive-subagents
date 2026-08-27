@@ -12,6 +12,7 @@ import {
   mkdirSync,
   copyFileSync,
   renameSync,
+  statSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -24,6 +25,7 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  isHerdrResourceNotFoundError,
   shellEscape,
   readScreen,
 } from "./herdr.ts";
@@ -36,10 +38,15 @@ import {
   readNameRegistry,
   readSubagentLoadout,
   registerName,
+  releaseOwnershipClaim,
   resolveNameInRegistry,
   seedSubagentSessionFile,
   summarizeSessionStats,
+  tryClaimName,
+  tryClaimSession,
+  unregisterName,
   writeSubagentLoadout,
+  type OwnershipClaim,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
@@ -668,6 +675,8 @@ interface RunningSubagent {
   sentinelFile?: string;
   completionSentinel: string;
   statusState: SubagentStatusState;
+  /** Durable exclusion for this transcript while its process may be alive. */
+  sessionClaim?: OwnershipClaim;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -981,35 +990,31 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   }, observedAt);
 }
 
-/**
- * Names claimed by spawns that are mid-launch but not yet registered in
- * `runningSubagents`. Parallel `subagent` tool calls run their synchronous
- * prefix (name defaulting) before any of them finishes `launchSubagent` and
- * registers, so without this they'd all see an empty map and pick the same
- * name. Reserved synchronously when a default name is chosen and released once
- * the subagent registers (or its launch fails).
- */
-const reservedNames = new Set<string>();
+function claimSpawnName(
+  artifactDir: string,
+  requestedName: string | undefined,
+  defaultBase: string,
+): { name: string; claim: OwnershipClaim } | { error: string } {
+  const explicit = requestedName?.trim();
+  if (explicit) {
+    const claim = tryClaimName(artifactDir, explicit);
+    return claim
+      ? { name: explicit, claim }
+      : { error: `Subagent name "${explicit}" is already owned by this session. Choose another explicit name.` };
+  }
 
-/**
- * Return `base`, or `base-2`, `base-3`, … so the result is unique within this
- * spawner session. Considers (a) currently-running subagents, (b) names
- * reserved by parallel in-flight spawns, and (c) every name already recorded in
- * the spawner's persistent registry — so a defaulted name never collides with a
- * finished subagent either. This lets `subagent_message({ name })` address any
- * subagent of this session unambiguously, running or finished.
- *
- * `registryNames` is the set of names already taken in the registry (empty when
- * there is no session file / artifact dir yet).
- */
-function uniqueRunningName(base: string, registryNames?: Set<string>): string {
-  const taken = new Set(Array.from(runningSubagents.values()).map((r) => r.name));
-  for (const reserved of reservedNames) taken.add(reserved);
-  if (registryNames) for (const n of registryNames) taken.add(n);
-  if (!taken.has(base)) return base;
-  let n = 2;
-  while (taken.has(`${base}-${n}`)) n++;
-  return `${base}-${n}`;
+  for (let suffix = 1; suffix < 10_000; suffix++) {
+    const name = suffix === 1 ? defaultBase : `${defaultBase}-${suffix}`;
+    const claim = tryClaimName(artifactDir, name);
+    if (claim) return { name, claim };
+  }
+  return { error: `Could not claim a free name based on "${defaultBase}".` };
+}
+
+function validateDirectory(path: string, label: string): void {
+  if (!existsSync(path) || !statSync(path).isDirectory()) {
+    throw new Error(`${label} is not a directory: ${path}`);
+  }
 }
 
 function resolveRunningByName(name: string):
@@ -1109,10 +1114,13 @@ function cancelRunningSubagent(
   let surfaceClosed = true;
   try {
     close(running.surface);
-  } catch {
-    // The user may already have closed the Herdr tab. Cancellation still owns
-    // and clears the parent-side lifecycle entry.
-    surfaceClosed = false;
+  } catch (error) {
+    // A confirmed-absent tab is already closed. Other failures are ambiguous,
+    // so retain the transcript claim while the child may still be alive.
+    surfaceClosed = isHerdrResourceNotFoundError(error);
+  }
+  if (surfaceClosed && running.sessionClaim) {
+    if (releaseOwnershipClaim(running.sessionClaim)) running.sessionClaim = undefined;
   }
   runningSubagents.delete(running.id);
   updateWidget();
@@ -1214,8 +1222,7 @@ export const __test__ = {
   observeRunningSubagent,
   getToolExtensionPath,
   resolveRunningByName,
-  uniqueRunningName,
-  reservedNames,
+  claimSpawnName,
   steerSubagent,
   handleSubagentSteer,
   cancelRunningSubagent,
@@ -1240,6 +1247,31 @@ function startWidgetRefresh() {
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
+class LaunchFailure extends Error {
+  ownershipRisk: "none" | "startup" | "rollback";
+  sessionFile?: string;
+
+  constructor(
+    message: string,
+    ownershipRisk: "none" | "startup" | "rollback",
+    sessionFile?: string,
+  ) {
+    super(message);
+    this.ownershipRisk = ownershipRisk;
+    this.sessionFile = sessionFile;
+  }
+}
+
+function closeLaunchSurface(surface: string | undefined): boolean {
+  if (!surface) return true;
+  try {
+    closeSurface(surface);
+    return true;
+  } catch (error) {
+    return isHerdrResourceNotFoundError(error);
+  }
+}
+
 /**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
@@ -1253,7 +1285,7 @@ async function launchSubagent(
     cwd: string;
     model?: { provider?: string; id?: string } | null;
   },
-  options?: { surface?: string },
+  options: { parentArtifactDir: string; surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1286,14 +1318,6 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 6),
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
-
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name, targetCwdForSession);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1361,15 +1385,62 @@ async function launchSubagent(
 
     const launchScriptName = `${artifactStem(params.name)}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+    const sessionClaim = tryClaimSession(options.parentArtifactDir, subagentSessionFile, params.name);
+    if (!sessionClaim) {
+      throw new LaunchFailure(`Session ${subagentSessionFile} is already launching or running`, "none");
+    }
+    try {
+      registerName(options.parentArtifactDir, params.name, {
+        sessionFile: subagentSessionFile,
+        sessionId: getSessionId(subagentSessionFile),
+      });
+    } catch (error: any) {
+      releaseOwnershipClaim(sessionClaim);
+      throw new LaunchFailure(error?.message ?? String(error), "none", subagentSessionFile);
+    }
 
-    sendLongCommand(surface, command, { scriptPath: launchScriptFile });
+    let surface: string | undefined;
+    let dispatchAttempted = false;
+    try {
+      const surfacePreCreated = !!options.surface;
+      surface = options.surface ?? createSurface(params.name, targetCwdForSession);
+      if (!surfacePreCreated) {
+        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+      }
+      sendLongCommand(surface, command, {
+        scriptPath: launchScriptFile,
+        onDispatch: () => { dispatchAttempted = true; },
+      });
+    } catch (error: any) {
+      const surfaceClosed = closeLaunchSurface(surface);
+      let rollbackError: unknown;
+      if (!dispatchAttempted) {
+        try {
+          unregisterName(options.parentArtifactDir, params.name, subagentSessionFile);
+          if (!releaseOwnershipClaim(sessionClaim)) {
+            rollbackError = new Error(`could not release transcript claim at ${sessionClaim.path}`);
+          }
+        } catch (failure) {
+          rollbackError = failure;
+        }
+      }
+      const cleanup = [
+        !surfaceClosed ? "the pre-start surface could not be confirmed closed" : "",
+        rollbackError ? `ownership rollback failed: ${(rollbackError as any)?.message ?? String(rollbackError)}` : "",
+      ].filter(Boolean).join("; ");
+      throw new LaunchFailure(
+        `Failed to launch "${params.name}": ${error?.message ?? String(error)}${cleanup ? ` (${cleanup})` : ""}`,
+        dispatchAttempted ? "startup" : rollbackError ? "rollback" : "none",
+        subagentSessionFile,
+      );
+    }
 
     const running: RunningSubagent = {
       id,
       name: params.name,
       task: params.task,
       agent: params.agent,
-      surface,
+      surface: surface!,
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
@@ -1381,6 +1452,7 @@ async function launchSubagent(
         source: "claude",
         startTimeMs: startTime,
       }),
+      sessionClaim,
     };
 
     runningSubagents.set(id, running);
@@ -1447,8 +1519,6 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
-  const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
   // Only full-context fork mode gets a direct task argument because it already
@@ -1478,18 +1548,68 @@ async function launchSubagent(
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '${completionSentinel}'$?'__'`;
   const launchScriptName = `${artifactStem(params.name)}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, { scriptPath: launchScriptFile });
+  const sessionClaim = tryClaimSession(options.parentArtifactDir, subagentSessionFile, params.name);
+  if (!sessionClaim) {
+    throw new LaunchFailure(`Session ${subagentSessionFile} is already launching or running`, "none");
+  }
+  try {
+    registerName(options.parentArtifactDir, params.name, {
+      sessionFile: subagentSessionFile,
+      sessionId: getSessionId(subagentSessionFile),
+    });
+  } catch (error: any) {
+    releaseOwnershipClaim(sessionClaim);
+    throw new LaunchFailure(error?.message ?? String(error), "none", subagentSessionFile);
+  }
+
+  let surface: string | undefined;
+  let dispatchAttempted = false;
+  try {
+    const surfacePreCreated = !!options.surface;
+    surface = options.surface ?? createSurface(params.name, targetCwdForSession);
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+    envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+    const envPrefix = envParts.join(" ") + " ";
+    const piCommand = cdPrefix + envPrefix + parts.join(" ");
+    const command = `${piCommand}; echo '${completionSentinel}'$?'__'`;
+    sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      onDispatch: () => { dispatchAttempted = true; },
+    });
+  } catch (error: any) {
+    const surfaceClosed = closeLaunchSurface(surface);
+    let rollbackError: unknown;
+    if (!dispatchAttempted) {
+      try {
+        unregisterName(options.parentArtifactDir, params.name, subagentSessionFile);
+        if (!releaseOwnershipClaim(sessionClaim)) {
+          rollbackError = new Error(`could not release transcript claim at ${sessionClaim.path}`);
+        }
+      } catch (failure) {
+        rollbackError = failure;
+      }
+    }
+    const cleanup = [
+      !surfaceClosed ? "the pre-start surface could not be confirmed closed" : "",
+      rollbackError ? `ownership rollback failed: ${(rollbackError as any)?.message ?? String(rollbackError)}` : "",
+    ].filter(Boolean).join("; ");
+    throw new LaunchFailure(
+      `Failed to launch "${params.name}": ${error?.message ?? String(error)}${cleanup ? ` (${cleanup})` : ""}`,
+      dispatchAttempted ? "startup" : rollbackError ? "rollback" : "none",
+      subagentSessionFile,
+    );
+  }
 
   const running: RunningSubagent = {
     id,
     name: params.name,
     task: params.task,
     agent: params.agent,
-    surface,
+    surface: surface!,
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
@@ -1500,6 +1620,7 @@ async function launchSubagent(
       source: "pi",
       startTimeMs: startTime,
     }),
+    sessionClaim,
   };
 
   runningSubagents.set(id, running);
@@ -1623,6 +1744,17 @@ async function watchSubagent(
       },
     });
 
+    // Herdr's completion sentinel is authoritative: once observed, this
+    // transcript is no longer running even if result extraction or tab cleanup
+    // later fails.
+    if (running.sessionClaim) {
+      if (!releaseOwnershipClaim(running.sessionClaim)) {
+        throw new Error(
+          `Subagent "${name}" finished, but its transcript ownership claim could not be released at ${running.sessionClaim.path}`,
+        );
+      }
+      running.sessionClaim = undefined;
+    }
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
     if (running.cli === "claude") {
@@ -1701,9 +1833,15 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
+    let surfaceClosed = true;
     try {
       closeSurface(surface);
-    } catch {}
+    } catch (closeError) {
+      surfaceClosed = isHerdrResourceNotFoundError(closeError);
+    }
+    if (surfaceClosed && running.sessionClaim) {
+      if (releaseOwnershipClaim(running.sessionClaim)) running.sessionClaim = undefined;
+    }
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -1760,10 +1898,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
-    }
-    runningSubagents.clear();
+    // Close each surface and release its transcript claim only after closure is
+    // confirmed. The aborted watcher may finish concurrently; release is
+    // token-validated and idempotent.
+    cancelAllRunningSubagents();
     latestCtx?.ui.setWidget("subagent-status", undefined);
     latestCtx = null;
   });
@@ -1876,36 +2014,54 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionId(),
         );
 
-        // Default the cosmetic pane label to the agent name when omitted,
-        // disambiguating against running subagents, in-flight reservations, and
-        // every name already in the registry — so names stay unique across the
-        // whole session, running or finished. Reserve the chosen name
-        // synchronously (before any await) so parallel spawns don't collide.
-        let reservedName: string | null = null;
-        if (!params.name?.trim()) {
-          const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-          params.name = uniqueRunningName(params.agent, registryNames);
-          reservedName = params.name;
-          reservedNames.add(reservedName);
-        }
-
-        // Launch the subagent (creates pane, sends command). Release the name
-        // reservation once it registers in runningSubagents (or launch fails) —
-        // from then on uniqueRunningName tracks it via the running map.
-        let running;
+        // Validate every local path before claiming a name or creating a tab.
+        // A claim is then the first ownership mutation and always precedes the
+        // first mutating Herdr call.
         try {
-          running = await launchSubagent(params, ctx);
-        } finally {
-          if (reservedName) reservedNames.delete(reservedName);
+          const defs = loadAgentDefaults(params.agent);
+          const { effectiveCwd } = resolveSubagentPaths(params, defs);
+          validateDirectory(effectiveCwd ?? ctx.cwd, "Subagent cwd");
+        } catch (error: any) {
+          const err = error?.message ?? String(error);
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        // Persist name → session so subagent_message({ name }) can resume this
-        // subagent after it finishes (and after a pi restart). Done at launch,
-        // not completion, so the handle exists even if the parent dies mid-run.
-        registerName(parentArtifactDir, running.name, {
-          sessionFile: running.sessionFile,
-          sessionId: getSessionId(running.sessionFile),
-        });
+        let claimed: ReturnType<typeof claimSpawnName>;
+        try {
+          claimed = claimSpawnName(parentArtifactDir, params.name, params.agent);
+        } catch (error: any) {
+          const err = error?.message ?? String(error);
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        if ("error" in claimed) {
+          return {
+            content: [{ type: "text" as const, text: claimed.error }],
+            details: { error: claimed.error },
+          };
+        }
+        params.name = claimed.name;
+
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent(params, ctx, { parentArtifactDir });
+        } catch (error: any) {
+          const launch = error as LaunchFailure;
+          const ownershipRisk = launch.ownershipRisk ?? "none";
+          const retainOwnership = ownershipRisk !== "none";
+          if (!retainOwnership) {
+            releaseOwnershipClaim(claimed.claim);
+          }
+          const retained = ownershipRisk === "startup"
+            ? ` Startup may have begun, so ownership was retained at ${claimed.claim.path}; inspect/close the child before recovery.`
+            : ownershipRisk === "rollback"
+              ? ` Ownership rollback was incomplete, so the name claim was retained at ${claimed.claim.path} for diagnosis.`
+              : " The empty launch was rolled back and its name was released.";
+          const err = `${launch.message ?? String(error)}.${retained}`;
+          return {
+            content: [{ type: "text" as const, text: err }],
+            details: { error: err, ownershipRetained: retainOwnership },
+          };
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -2211,8 +2367,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const requestedName = params.name?.trim();
+        const requestedMessage = params.message?.trim();
         if (!requestedName) {
           const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        if (!requestedMessage) {
+          const err = "Provide a non-empty `message` to steer or resume the subagent.";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
@@ -2280,6 +2441,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `Re-run the task as a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
+        try {
+          validateDirectory(loadout.cwd ?? ctx.cwd, "Subagent resume cwd");
+        } catch (error: any) {
+          const err = error?.message ?? String(error);
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
 
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
@@ -2287,9 +2454,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Count lines cheaply (no per-line JSON.parse) so resuming a large
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
-
-        const surface = createSurface(name, loadout.cwd ?? ctx.cwd);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2352,14 +2516,46 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           "subagent-scripts",
           `${artifactStem(name, "resume")}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, { scriptPath: launchScriptFile });
+        const sessionClaim = tryClaimSession(parentArtifactDir, sessionPath, name);
+        if (!sessionClaim) {
+          const err =
+            `Cannot resume "${name}": this transcript is already claimed by another launch or ` +
+            `a prior launch whose external state is unresolved. Refusing to run it twice.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        let surface: string | undefined;
+        let dispatchAttempted = false;
+        try {
+          surface = createSurface(name, loadout.cwd ?? ctx.cwd);
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+          sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            onDispatch: () => { dispatchAttempted = true; },
+          });
+        } catch (error: any) {
+          const surfaceClosed = closeLaunchSurface(surface);
+          const released = !dispatchAttempted && releaseOwnershipClaim(sessionClaim);
+          const ownershipRetained = !released;
+          const retained = dispatchAttempted
+            ? ` Startup may have begun; the transcript claim was retained at ${sessionClaim.path}.`
+            : released
+              ? " Startup did not begin; the transcript claim was released."
+              : ` Startup did not begin, but the transcript claim could not be released at ${sessionClaim.path}.`;
+          const cleanup = surfaceClosed ? "" : " The pre-start surface could not be confirmed closed.";
+          const err = `Failed to resume "${name}": ${error?.message ?? String(error)}.${retained}${cleanup}`;
+          return {
+            content: [{ type: "text" as const, text: err }],
+            details: { error: err, ownershipRetained },
+          };
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
           name,
           task: message,
-          surface,
+          surface: surface!,
           startTime,
           sessionFile: sessionPath,
           launchScriptFile,
@@ -2370,6 +2566,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             source: "pi",
             startTimeMs: startTime,
           }),
+          sessionClaim,
         };
         runningSubagents.set(id, running);
         startWidgetRefresh();

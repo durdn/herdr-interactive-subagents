@@ -28,6 +28,9 @@ if (args[0] === "agent" && args[1] === "list") {
   json({ result: { agents: state.live || [] } });
 }
 if (args[0] === "agent" && args[1] === "get") {
+  if (process.env.HS_FAKE_GET_FAILURE === "1") {
+    json({ error: { code: "server_unavailable", message: "fake get failure" } }, 1);
+  }
   const agent = (state.live || []).find((item) => item.name === args[2]);
   json(agent ? { result: { agent } } : { error: { code: "agent_not_found" } }, agent ? 0 : 1);
 }
@@ -41,7 +44,8 @@ if (args[0] === "tab" && args[1] === "create") {
 }
 if (args[0] === "agent" && args[1] === "start") {
   state.starts++;
-  if (process.env.HS_FAKE_BUSY_ONCE === "1" && state.starts === 1) {
+  if (process.env.HS_FAKE_START_BUSY_ALWAYS === "1"
+    || (process.env.HS_FAKE_BUSY_ONCE === "1" && state.starts === 1)) {
     json({ error: { code: "agent_pane_busy", message: "shell is starting" } }, 1);
   }
   if (process.env.HS_FAKE_START_FAILURE === "1") {
@@ -57,6 +61,9 @@ if (args[0] === "agent" && args[1] === "read") {
   process.exit(0);
 }
 if (args[0] === "tab" && args[1] === "close") {
+  if (process.env.HS_FAKE_CLOSE_FAILURE === "1") {
+    json({ error: { code: "tab_close_failed", message: "fake close failure" } }, 1);
+  }
   state.live = [];
   json({ result: { closed: args[2] } });
 }

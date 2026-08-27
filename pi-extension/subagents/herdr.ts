@@ -195,7 +195,12 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: {
+    scriptPath?: string;
+    scriptPreamble?: string;
+    /** Called after local script persistence, immediately before Herdr dispatch. */
+    onDispatch?: () => void;
+  },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -211,6 +216,7 @@ export function sendLongCommand(
   scriptParts.push(command);
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", { mode: 0o755 });
 
+  options?.onDispatch?.();
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
@@ -310,13 +316,13 @@ function consumeExitSidecar(sessionFile: string): PollResult | null {
   }
 }
 
-function isPaneNotFoundError(error: unknown): boolean {
+export function isHerdrResourceNotFoundError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const candidate = error as { message?: unknown; stdout?: unknown; stderr?: unknown };
   const text = [candidate.message, candidate.stdout, candidate.stderr]
     .filter((value): value is string => typeof value === "string")
     .join("\n");
-  return /pane_not_found|pane\s+[^\s]+\s+not found/i.test(text);
+  return /(?:pane|tab|agent)_not_found|(?:pane|tab|agent)\s+[^\s]+\s+not found/i.test(text);
 }
 
 function findCompletionExitCode(screen: string, sentinel = "__SUBAGENT_DONE_"): number | null {
@@ -328,12 +334,12 @@ function findCompletionExitCode(screen: string, sentinel = "__SUBAGENT_DONE_"): 
 export const __pollForExitTest__ = {
   findCompletionExitCode,
   interpretExitSidecar,
-  isPaneNotFoundError,
+  isPaneNotFoundError: isHerdrResourceNotFoundError,
 };
 
 /**
- * Poll until the subagent exits. Pi's lifecycle sidecars provide the fast path;
- * the terminal sentinel catches clean completion and process crashes.
+ * Poll until the subagent exits. Pi's lifecycle sidecar preserves rich error
+ * details; the terminal sentinel proves the process has actually returned.
  */
 export async function pollForExit(
   surface: string,
@@ -347,13 +353,17 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let pendingSidecar: PollResult | null = null;
 
   for (;;) {
     if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
 
-    if (options.sessionFile) {
-      const sidecarResult = consumeExitSidecar(options.sessionFile);
-      if (sidecarResult) return sidecarResult;
+    if (options.sessionFile && !pendingSidecar) {
+      // The lifecycle sidecar is written immediately before ctx.shutdown(); it
+      // carries richer error information but does not prove that the Pi process
+      // has exited yet. Hold it until the shell sentinel (or confirmed pane
+      // disappearance) so a resume cannot claim the transcript during shutdown.
+      pendingSidecar = consumeExitSidecar(options.sessionFile);
     }
 
     if (options.sentinelFile) {
@@ -365,14 +375,15 @@ export async function pollForExit(
     try {
       const screen = await readScreenAsync(surface, 5);
       const exitCode = findCompletionExitCode(screen, options.completionSentinel);
-      if (exitCode != null) return { reason: "sentinel", exitCode };
-    } catch (error) {
-      if (options.sessionFile) {
-        const sidecarResult = consumeExitSidecar(options.sessionFile);
-        if (sidecarResult) return sidecarResult;
+      if (exitCode != null) {
+        return pendingSidecar ?? { reason: "sentinel", exitCode };
       }
-      if (isPaneNotFoundError(error)) {
-        return {
+    } catch (error) {
+      if (options.sessionFile && !pendingSidecar) {
+        pendingSidecar = consumeExitSidecar(options.sessionFile);
+      }
+      if (isHerdrResourceNotFoundError(error)) {
+        return pendingSidecar ?? {
           reason: "error",
           exitCode: 1,
           errorMessage: "Subagent Herdr pane was closed externally.",

@@ -1,6 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, rmSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -23,8 +24,12 @@ import {
   readNameRegistry,
   readSubagentLoadout,
   registerName,
+  releaseOwnershipClaim,
   resolveNameInRegistry,
   nameRegistryPath,
+  readOwnershipClaims,
+  tryClaimName,
+  tryClaimSession,
   writeSubagentLoadout,
   loadoutSidecarPath,
   type SubagentLoadout,
@@ -312,6 +317,12 @@ describe("session.ts", () => {
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null);
     });
+
+    it("surfaces loadout persistence failure instead of creating a non-resumable handle", () => {
+      const sf = join(dir, "s4.jsonl");
+      mkdirSync(sf + ".loadout.json");
+      assert.throws(() => writeSubagentLoadout(sf, sample));
+    });
   });
 
   describe("subagent name registry", () => {
@@ -323,24 +334,71 @@ describe("session.ts", () => {
       assert.ok(existsSync(nameRegistryPath(adir)));
     });
 
-    it("accumulates multiple names and overwrites on re-register", () => {
+    it("accumulates names but refuses to overwrite an owned mapping", () => {
       const adir = join(dir, "art-2");
       registerName(adir, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
       registerName(adir, "scout-2", { sessionFile: "/s/scout2.jsonl", sessionId: "id-scout2" });
       const reg = readNameRegistry(adir);
       assert.deepEqual(Object.keys(reg).sort(), ["scout", "scout-2"]);
-      // Overwrite scout with a new session file.
-      registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
-      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
+      assert.throws(
+        () => registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" }),
+        /already registered/,
+      );
+      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout.jsonl");
     });
 
-    it("returns null for unknown names and {} for a missing/corrupt registry", () => {
+    it("uses atomic durable claims for names and transcript runs", () => {
+      const adir = join(dir, "art-claims");
+      const name = tryClaimName(adir, "worker");
+      assert.ok(name);
+      assert.equal(tryClaimName(adir, "worker"), null);
+      const session = tryClaimSession(adir, join(dir, "worker.jsonl"), "worker");
+      assert.ok(session);
+      assert.equal(tryClaimSession(adir, join(dir, "worker.jsonl"), "worker"), null);
+      assert.equal(readOwnershipClaims(adir, "name").length, 1);
+      assert.equal(readOwnershipClaims(adir, "session").length, 1);
+      assert.equal(
+        releaseOwnershipClaim({ ...session!, token: "not-the-owner" }),
+        false,
+        "a mismatched token must not remove another owner's claim",
+      );
+      assert.equal(readOwnershipClaims(adir, "session").length, 1);
+      assert.equal(releaseOwnershipClaim(session!), true);
+      assert.equal(releaseOwnershipClaim(session!), true, "release should be idempotent once absent");
+      assert.ok(tryClaimSession(adir, join(dir, "worker.jsonl"), "worker"));
+    });
+
+    it("allows only one subprocess to claim a Pi transcript", async () => {
+      const adir = join(dir, "art-process-race");
+      const sessionFile = join(dir, "race.jsonl");
+      const moduleUrl = new URL("../pi-extension/subagents/session.ts", import.meta.url).href;
+      const code = [
+        `const m = await import(${JSON.stringify(moduleUrl)});`,
+        `const claim = m.tryClaimSession(process.argv[1], process.argv[2], "race");`,
+        `console.log(claim ? "claimed" : "blocked");`,
+      ].join("\n");
+      const launch = () => new Promise<{ status: number | null; stdout: string }>((resolveRun, reject) => {
+        const child = spawn(process.execPath, ["--input-type=module", "--eval", code, adir, sessionFile], {
+          stdio: ["ignore", "pipe", "inherit"],
+        });
+        let stdout = "";
+        child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+        child.on("error", reject);
+        child.on("close", (status) => resolveRun({ status, stdout: stdout.trim() }));
+      });
+      const results = await Promise.all([launch(), launch()]);
+      assert.deepEqual(results.map((r) => r.status), [0, 0]);
+      assert.deepEqual(results.map((r) => r.stdout).sort(), ["blocked", "claimed"]);
+    });
+
+    it("keeps tolerant legacy reads but fails closed on corrupt-registry mutation", () => {
       const adir = join(dir, "art-3");
       assert.equal(resolveNameInRegistry(adir, "nope"), null);
       assert.deepEqual(readNameRegistry(adir), {});
       mkdirSync(adir, { recursive: true });
       writeFileSync(nameRegistryPath(adir), "not json{", "utf8");
       assert.deepEqual(readNameRegistry(adir), {});
+      assert.throws(() => tryClaimName(adir, "worker"), /registry is corrupt/i);
     });
   });
 
@@ -2184,69 +2242,15 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("uniqueRunningName suffixes defaulted names that collide with running subagents", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    runningMap.clear();
-
-    try {
-      // No collision: base name is returned untouched.
-      assert.equal(testApi.uniqueRunningName("worker"), "worker");
-
-      runningMap.set("a1", makeRunning({ id: "a1", name: "worker", surface: "a1" }));
-      assert.equal(testApi.uniqueRunningName("worker"), "worker-2");
-
-      runningMap.set("b2", makeRunning({ id: "b2", name: "worker-2", surface: "b2" }));
-      assert.equal(testApi.uniqueRunningName("worker"), "worker-3");
-
-      // A distinct base is unaffected by the worker collisions.
-      assert.equal(testApi.uniqueRunningName("scout"), "scout");
-    } finally {
-      runningMap.clear();
-    }
-  });
-
-  it("uniqueRunningName also avoids names already taken in the persistent registry", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    const reserved = testApi.reservedNames as Set<string>;
-    runningMap.clear();
-    reserved.clear();
-
-    try {
-      // A finished subagent's name lives in the registry even though nothing is
-      // running — a fresh default must skip it so names stay unique session-wide.
-      const registryNames = new Set(["worker", "worker-2"]);
-      assert.equal(testApi.uniqueRunningName("worker", registryNames), "worker-3");
-      // A name not in the registry (or running/reserved) is unaffected.
-      assert.equal(testApi.uniqueRunningName("scout", registryNames), "scout");
-      // An empty registry behaves like before.
-      assert.equal(testApi.uniqueRunningName("worker", new Set()), "worker");
-    } finally {
-      runningMap.clear();
-      reserved.clear();
-    }
-  });
-
-  it("uniqueRunningName also avoids names reserved by in-flight parallel spawns", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    const reserved = testApi.reservedNames as Set<string>;
-    runningMap.clear();
-    reserved.clear();
-
-    try {
-      // Simulate the first parallel spawn reserving its default name before it
-      // has registered in runningSubagents.
-      reserved.add(testApi.uniqueRunningName("scout")); // "scout"
-      // The second spawn, running concurrently, must not reuse it.
-      assert.equal(testApi.uniqueRunningName("scout"), "scout-2");
-      reserved.add("scout-2");
-      assert.equal(testApi.uniqueRunningName("scout"), "scout-3");
-    } finally {
-      runningMap.clear();
-      reserved.clear();
-    }
+  it("atomically suffixes default Pi names and rejects duplicate explicit names", () => {
+    withTempDir((artifactDir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const first = testApi.claimSpawnName(artifactDir, undefined, "worker");
+      const second = testApi.claimSpawnName(artifactDir, undefined, "worker");
+      assert.equal(first.name, "worker");
+      assert.equal(second.name, "worker-2");
+      assert.match(testApi.claimSpawnName(artifactDir, "worker", "unused").error, /already owned/);
+    });
   });
 
   it("steers a running subagent by typing into its pane (newlines flattened)", () => {
@@ -2369,24 +2373,53 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("cancels one running subagent even when its Herdr pane is already gone", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    const abortController = new AbortController();
-    const running = makeRunning({ abortController });
-    runningMap.clear();
-    runningMap.set(running.id, running);
-
-    try {
-      const result = testApi.cancelRunningSubagent(running, () => {
-        throw new Error("pane_not_found");
-      });
-      assert.deepEqual(result, { name: "Worker", surfaceClosed: false });
-      assert.equal(abortController.signal.aborted, true);
-      assert.equal(runningMap.size, 0);
-    } finally {
+  it("cancels one running subagent and releases ownership when its Herdr pane is already gone", () => {
+    withTempDir((artifactDir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      const abortController = new AbortController();
+      const claim = tryClaimSession(artifactDir, join(artifactDir, "worker.jsonl"), "Worker");
+      assert.ok(claim);
+      const running = makeRunning({ abortController, sessionClaim: claim });
       runningMap.clear();
-    }
+      runningMap.set(running.id, running);
+
+      try {
+        const result = testApi.cancelRunningSubagent(running, () => {
+          throw new Error("pane_not_found");
+        });
+        assert.deepEqual(result, { name: "Worker", surfaceClosed: true });
+        assert.equal(abortController.signal.aborted, true);
+        assert.equal(running.sessionClaim, undefined);
+        assert.equal(readOwnershipClaims(artifactDir, "session").length, 0);
+        assert.equal(runningMap.size, 0);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
+  it("retains transcript ownership when cancellation cannot confirm closure", () => {
+    withTempDir((artifactDir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      const claim = tryClaimSession(artifactDir, join(artifactDir, "worker.jsonl"), "Worker");
+      assert.ok(claim);
+      const running = makeRunning({ sessionClaim: claim });
+      runningMap.clear();
+      runningMap.set(running.id, running);
+
+      try {
+        const result = testApi.cancelRunningSubagent(running, () => {
+          throw new Error("Herdr transport failed");
+        });
+        assert.deepEqual(result, { name: "Worker", surfaceClosed: false });
+        assert.equal(readOwnershipClaims(artifactDir, "session").length, 1);
+      } finally {
+        releaseOwnershipClaim(claim!);
+        runningMap.clear();
+      }
+    });
   });
 
   it("cancels all running subagents and clears the lifecycle map", () => {

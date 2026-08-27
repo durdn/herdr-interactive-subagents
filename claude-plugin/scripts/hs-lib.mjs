@@ -3,8 +3,9 @@
 // registry, callback, and installation contract between them.
 
 import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
-  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync,
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync,
   symlinkSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -67,9 +68,10 @@ function herdrJson(args, opts) {
   }
 }
 
+class HsError extends Error {}
+
 function die(message) {
-  console.error(`hs: ${message}`);
-  process.exit(1);
+  throw new HsError(message);
 }
 
 function sleepSync(ms) {
@@ -189,31 +191,163 @@ function writeBrief(name, task) {
 // Only records what Herdr cannot: which children THIS orchestrator owns, and
 // with which role. Live state is always read back from Herdr.
 
-function registryPath() {
-  return join(homedir(), ".claude", "herdr-subagents", parentSessionId(), "registry.json");
+function ownershipRoot() {
+  return join(homedir(), ".claude", "herdr-subagents");
 }
 
-function readRegistry() {
+function registryPath() {
+  return join(ownershipRoot(), parentSessionId(), "registry.json");
+}
+
+function readRegistry({ strict = false } = {}) {
   const p = registryPath();
   if (!existsSync(p)) return { children: [] };
   try {
     const parsed = JSON.parse(readFileSync(p, "utf8"));
-    return Array.isArray(parsed?.children) ? parsed : { children: [] };
-  } catch {
+    if (!Array.isArray(parsed?.children)) throw new Error("missing children array");
+    return parsed;
+  } catch (error) {
+    if (strict) die(`registry is corrupt at ${p}: ${error.message}`);
     return { children: [] };
   }
 }
 
-function writeRegistry(reg) {
+function withRegistryLock(run) {
   const p = registryPath();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(reg, null, 2));
+  const lock = p + ".lock";
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try { mkdirSync(lock); break; }
+    catch (error) {
+      if (error?.code !== "EEXIST" || Date.now() >= deadline) throw error;
+      sleepSync(10);
+    }
+  }
+  try { return run(); }
+  finally { rmSync(lock, { recursive: true, force: true }); }
+}
+
+function writeRegistryUnlocked(reg) {
+  const p = registryPath();
+  const tmp = `${p}.tmp-${process.pid}-${randomUUID()}`;
+  writeFileSync(tmp, JSON.stringify(reg, null, 2));
+  try { renameSync(tmp, p); }
+  catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
+function writeRegistry(reg) {
+  withRegistryLock(() => writeRegistryUnlocked(reg));
 }
 
 function upsertChild(entry) {
-  const reg = readRegistry();
-  reg.children = reg.children.filter((c) => c.name !== entry.name).concat(entry);
-  writeRegistry(reg);
+  withRegistryLock(() => {
+    const reg = readRegistry({ strict: true });
+    const existing = reg.children.find((c) => c.name === entry.name);
+    if (existing?.sessionId && entry.sessionId && existing.sessionId !== entry.sessionId) {
+      die(`refusing to replace owned child '${entry.name}' (${existing.sessionId}) with ${entry.sessionId}`);
+    }
+    reg.children = reg.children.filter((c) => c.name !== entry.name).concat(entry);
+    writeRegistryUnlocked(reg);
+  });
+}
+
+function claimDir(kind, key) {
+  const digest = createHash("sha256").update(key).digest("hex");
+  return join(ownershipRoot(), "claims", `${kind}s`, digest);
+}
+
+function readClaim(kind, key) {
+  const path = claimDir(kind, key);
+  try {
+    return { path, record: JSON.parse(readFileSync(join(path, "claim.json"), "utf8")) };
+  } catch {
+    return existsSync(path) ? { path, record: null } : null;
+  }
+}
+
+function tryClaim(kind, key, details = {}) {
+  const path = claimDir(kind, key);
+  mkdirSync(dirname(path), { recursive: true });
+  try { mkdirSync(path); }
+  catch (error) {
+    if (error?.code === "EEXIST") return null;
+    throw error;
+  }
+  const claim = {
+    version: 1, kind, key, token: randomUUID(), pid: process.pid,
+    parent: parentSessionId(), createdAt: new Date().toISOString(), ...details,
+  };
+  try {
+    writeFileSync(join(path, "claim.json"), JSON.stringify(claim, null, 2));
+    return { path, record: claim };
+  } catch (error) {
+    rmSync(path, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function releaseClaim(claim) {
+  if (!claim) return false;
+  try {
+    const current = JSON.parse(readFileSync(join(claim.path, "claim.json"), "utf8"));
+    if (current?.token !== claim.record?.token || current?.key !== claim.record?.key) return false;
+    rmSync(claim.path, { recursive: true, force: true });
+    return true;
+  } catch { return false; }
+}
+
+function legacyNameOwner(name) {
+  const root = ownershipRoot();
+  if (!existsSync(root)) return null;
+  for (const child of readdirSync(root)) {
+    if (child === "claims") continue;
+    const p = join(root, child, "registry.json");
+    if (!existsSync(p)) continue;
+    try {
+      const found = JSON.parse(readFileSync(p, "utf8"))?.children?.find((c) => c.name === name);
+      if (found) return { parent: child, entry: found };
+    } catch {
+      // Corrupt legacy ownership is ambiguous. Reserve its parent directory's
+      // names by refusing mutations only when it is this caller's registry.
+      if (child === parentSessionId()) readRegistry({ strict: true });
+    }
+  }
+  return null;
+}
+
+function claimNewName(name, sessionId) {
+  if (legacyNameOwner(name)) return null;
+  const claim = tryClaim("name", name, { name, sessionId });
+  if (!claim) return null;
+  if (legacyNameOwner(name)) {
+    releaseClaim(claim);
+    return null;
+  }
+  return claim;
+}
+
+function ensureOwnedNameClaim(entry) {
+  const existing = readClaim("name", entry.name);
+  if (existing) {
+    if (existing.record?.parent !== parentSessionId()
+      || (existing.record?.sessionId && existing.record.sessionId !== entry.sessionId)) {
+      die(`name '${entry.name}' is claimed by ${existing.record?.parent || existing.path}`);
+    }
+    return existing;
+  }
+  const owner = legacyNameOwner(entry.name);
+  if (owner && owner.parent !== parentSessionId()) {
+    die(`name '${entry.name}' is owned by parent session ${owner.parent}`);
+  }
+  return tryClaim("name", entry.name, { name: entry.name, sessionId: entry.sessionId });
+}
+
+function claimSessionRun(entry) {
+  return tryClaim("session", entry.sessionId, { name: entry.name, sessionId: entry.sessionId });
 }
 
 /**
@@ -221,21 +355,25 @@ function upsertChild(entry) {
  * its id. Keep the entry and mark it, or `resume` would have nothing to replay.
  */
 function markStopped(name) {
-  const reg = readRegistry();
-  const entry = reg.children.find((c) => c.name === name) || null;
-  if (entry) {
-    entry.stoppedAt = new Date().toISOString();
-    writeRegistry(reg);
-  }
-  return entry;
+  return withRegistryLock(() => {
+    const reg = readRegistry({ strict: true });
+    const entry = reg.children.find((c) => c.name === name) || null;
+    if (entry) {
+      entry.stoppedAt = new Date().toISOString();
+      writeRegistryUnlocked(reg);
+    }
+    return entry;
+  });
 }
 
 function forgetChild(name) {
-  const reg = readRegistry();
-  const before = reg.children.length;
-  reg.children = reg.children.filter((c) => c.name !== name);
-  writeRegistry(reg);
-  return reg.children.length < before;
+  return withRegistryLock(() => {
+    const reg = readRegistry({ strict: true });
+    const before = reg.children.length;
+    reg.children = reg.children.filter((c) => c.name !== name);
+    writeRegistryUnlocked(reg);
+    return reg.children.length < before;
+  });
 }
 
 // -- roles -----------------------------------------------------------------
@@ -352,15 +490,21 @@ function liveAgentNames() {
   return new Set((res?.result?.agents || []).map((a) => a.name).filter(Boolean));
 }
 
-function uniqueName(base) {
-  const taken = liveAgentNames();
-  for (const c of readRegistry().children) taken.add(c.name);
-  if (!taken.has(base)) return base;
-  for (let i = 2; i < 100; i++) {
-    const candidate = `${base.slice(0, 29)}-${i}`;
-    if (!taken.has(candidate)) return candidate;
+function claimLaunchName(base, sessionId, { explicit }) {
+  const live = liveAgentNames();
+  const candidates = explicit
+    ? [base]
+    : Array.from({ length: 99 }, (_, i) => i === 0 ? base : `${base.slice(0, 29)}-${i + 1}`);
+  for (const candidate of candidates) {
+    if (live.has(candidate)) {
+      if (explicit) die(`explicit name '${candidate}' is already live`);
+      continue;
+    }
+    const claim = claimNewName(candidate, sessionId);
+    if (claim) return { name: candidate, claim };
+    if (explicit) die(`explicit name '${candidate}' is already owned; choose another name`);
   }
-  die(`could not find a free name based on '${base}'`);
+  die(`could not claim a free name based on '${base}'`);
 }
 
 // -- transcripts -----------------------------------------------------------
@@ -409,6 +553,11 @@ function lastAssistantMessage(sessionId) {
 
 // -- commands --------------------------------------------------------------
 
+function closeTabForRollback(tabId) {
+  if (!tabId) return;
+  try { herdr(["tab", "close", tabId], { allowFailure: true }); } catch {}
+}
+
 function extraDirs(opts, role) {
   const raw = [].concat(opts.addDir || [], (role["add-dir"] || "").split(",")).filter(
     (d) => typeof d === "string" && d.trim(),
@@ -435,8 +584,6 @@ function cmdSpawn(opts) {
 
   const model = opts.model || role.model || null;
   if (model !== null && typeof model !== "string") die("--model needs one value");
-  // A child is an ordinary session, not a teammate: it does not inherit the
-  // orchestrator's model or effort. Record both so resume replays the loadout.
   const effort = opts.effort || role.effort || null;
   if (effort && !["low", "medium", "high", "xhigh", "max"].includes(effort)) {
     die(`unknown effort '${effort}' (low, medium, high, xhigh, max)`);
@@ -449,104 +596,141 @@ function cmdSpawn(opts) {
       "    with SendMessage instead.",
     ].join("\n"));
   }
-
-  // A bare role name collides with same-role children on other machines, which
-  // Claude Code surfaces as an ambiguous SendMessage target. Suffix by default.
-  const base = opts.name
-    ? sanitizeName(opts.name)
-    : `${sanitizeName(role.name).slice(0, 24)}-${crypto.randomUUID().slice(0, 4)}`;
-  const name = uniqueName(base);
-  if (!NAME_RE.test(name)) die(`derived name '${name}' is not a valid Herdr agent name`);
-
-  const sessionId = crypto.randomUUID();
-  const childArgs = ensureCallbackPrompt([
-    "--name", name,
-    "--session-id", sessionId,
-    // auto, not acceptEdits: acceptEdits stalls on ordinary tool approvals.
-    "--permission-mode", permissionMode,
-    "--agent", role.name,
-    "--plugin-dir", PLUGIN_DIR,
-    "--settings", '{"crossSessionInbound":"accept"}',
-  ]);
-  if (model) childArgs.push("--model", model);
-  if (effort) childArgs.push("--effort", effort);
-  // Anything outside cwd that the child may legitimately read; without this it
-  // blocks on an approval prompt the orchestrator must not answer for the user.
   const additionalDirs = extraDirs(opts, role);
   for (const dir of additionalDirs) {
     if (!existsSync(dir) || !lstatSync(dir).isDirectory()) die(`add-dir is not a directory: ${dir}`);
-    childArgs.push("--add-dir", dir);
   }
+
+  // Every local option is valid before ownership changes. Explicit duplicates
+  // fail; generated/default names use deterministic numeric suffix attempts.
+  const explicitName = Object.hasOwn(opts, "name");
+  if (explicitName && (typeof opts.name !== "string" || !opts.name.trim())) {
+    die("--name needs one non-empty value");
+  }
+  const sessionId = randomUUID();
+  const base = explicitName
+    ? sanitizeName(opts.name)
+    : `${sanitizeName(role.name).slice(0, 24)}-${randomUUID().slice(0, 4)}`;
+  if (!NAME_RE.test(base)) die(`derived name '${base}' is not a valid Herdr agent name`);
+  const claimedName = claimLaunchName(base, sessionId, { explicit: explicitName });
+  const { name, claim: nameClaim } = claimedName;
 
   let briefPath = null;
-  if (task) {
-    briefPath = writeBrief(name, task);
-    // The brief lives outside cwd, so the child needs it granted or it stalls on
-    // a permission prompt before it has read one word of the task.
-    childArgs.push("--add-dir", briefsDir());
+  let sessionClaim = null;
+  let workspace;
+  let childArgs;
+  try {
+    childArgs = ensureCallbackPrompt([
+      "--name", name, "--session-id", sessionId,
+      "--permission-mode", permissionMode, "--agent", role.name,
+      "--plugin-dir", PLUGIN_DIR, "--settings", '{"crossSessionInbound":"accept"}',
+    ]);
+    if (model) childArgs.push("--model", model);
+    if (effort) childArgs.push("--effort", effort);
+    for (const dir of additionalDirs) childArgs.push("--add-dir", dir);
+    if (task) {
+      briefPath = writeBrief(name, task);
+      childArgs.push("--add-dir", briefsDir());
+    }
+    try { writeShim({ quiet: true }); } catch { /* spawning does not depend on the convenience shim */ }
+    workspace = callerWorkspace();
+    sessionClaim = claimSessionRun({ name, sessionId });
+    if (!sessionClaim) die(`session ${sessionId} is already claimed`);
+  } catch (error) {
+    releaseClaim(sessionClaim);
+    releaseClaim(nameClaim);
+    if (briefPath) rmSync(briefPath, { force: true });
+    if (error instanceof HsError) throw error;
+    die(`local launch preparation failed: ${error.message}`);
   }
 
-  // The seed prompt is deliberately NOT part of the recorded argv: resume replays
-  // argv, and replaying a seed would re-run the whole task on a finished child.
-  //
-  // It goes FIRST, before any flag. Claude Code's --add-dir, --allowed-tools and
-  // friends are variadic, so a trailing positional is swallowed as one more value
-  // for whichever of them came last: the child then boots into an idle prompt with
-  // no task and no error, which looks exactly like a child that is still thinking.
   const seed = briefPath
     ? ["Read " + fwd(briefPath) + " and carry out the task brief it contains."]
     : [];
+  let tabId = null;
+  let paneId = null;
+  const baseEntry = {
+    name, sessionId, role: role.name, cwd, workspace, model, effort,
+    parent: parentSessionId(), startedAt: new Date().toISOString(), argv: childArgs,
+  };
+  const retainAmbiguous = (message) => {
+    const entry = {
+      ...baseEntry, tabId, paneId, startupUncertain: true,
+      launchError: message, ownershipClaim: nameClaim.path, sessionClaim: sessionClaim.path,
+    };
+    let registryError = "";
+    try {
+      upsertChild(entry);
+    } catch (error) {
+      registryError = ` Diagnostic registry persistence also failed: ${error.message}.`;
+    }
+    die(
+      `${message} Ownership retained for diagnosis at ${nameClaim.path}; `
+      + `transcript claim: ${sessionClaim.path}.${registryError} Stop/inspect before recovery.`,
+    );
+  };
+  const rollbackUnstarted = (message) => {
+    closeTabForRollback(tabId);
+    const sessionReleased = releaseClaim(sessionClaim);
+    const nameReleased = releaseClaim(nameClaim);
+    if (briefPath) rmSync(briefPath, { force: true });
+    if (!sessionReleased || !nameReleased) {
+      die(
+        `${message} Startup was ruled out, but ownership rollback was incomplete `
+        + `(name: ${nameClaim.path}; transcript: ${sessionClaim.path}).`,
+      );
+    }
+    die(message);
+  };
 
-  // All local preparation and validation above happens before the first
-  // mutating Herdr call, so a bad role, option, or unwritable brief cannot
-  // strand a tab.
-  try { writeShim({ quiet: true }); } catch { /* not fatal; spawning still works */ }
-  const workspace = callerWorkspace();
-  const created = herdrJson([
-    "tab", "create",
-    "--workspace", workspace,
-    "--cwd", cwd,
-    "--label", name,
-    "--no-focus",
-  ]);
-  const tabId = created?.result?.tab?.tab_id;
-  const paneId = created?.result?.root_pane?.pane_id;
-  if (!paneId) {
-    if (tabId) herdr(["tab", "close", tabId], { allowFailure: true });
-    die(`Herdr did not return a root pane: ${JSON.stringify(created)}`);
+  let created;
+  try {
+    created = herdrJson([
+      "tab", "create", "--workspace", workspace, "--cwd", cwd,
+      "--label", name, "--no-focus",
+    ]);
+  } catch (error) {
+    retainAmbiguous(`tab creation for '${name}' returned an ambiguous failure: ${error.message}`);
   }
+  tabId = created?.result?.tab?.tab_id || null;
+  paneId = created?.result?.root_pane?.pane_id || null;
+  if (!paneId) rollbackUnstarted(`Herdr did not return a root pane: ${JSON.stringify(created)}`);
 
-  const started = startAgentInPane(name, paneId, [...seed, ...childArgs]);
+  let started;
+  try {
+    started = startAgentInPane(name, paneId, [...seed, ...childArgs]);
+  } catch (error) {
+    closeTabForRollback(tabId);
+    retainAmbiguous(`agent start for '${name}' returned an ambiguous failure: ${error.message}`);
+  }
   const agent = started?.result?.agent;
   if (!agent) {
-    // Herdr keeps the name readable after agent_not_ready; capture the screen
-    // before the tab goes, so the reason survives.
-    const screen = herdr(["agent", "read", name, "--source", "detection", "--lines", "30"], {
-      allowFailure: true,
-    }).stdout || "";
-    herdr(["tab", "close", tabId], { allowFailure: true });
-    die([
+    const knownUnstarted = started?.error?.code === "agent_pane_busy";
+    let screen = "";
+    try {
+      screen = herdr(["agent", "read", name, "--source", "detection", "--lines", "30"], {
+        allowFailure: true,
+      }).stdout || "";
+    } catch {}
+    const message = [
       `could not start '${name}'; tab ${tabId} closed.`,
       `    ${started?.error?.message || JSON.stringify(started)}`,
       ...screen.split(/\r?\n/).filter(Boolean).slice(-12).map((l) => `    | ${l}`),
-    ].join("\n"));
+    ].join("\n");
+    if (knownUnstarted) rollbackUnstarted(message);
+    closeTabForRollback(tabId);
+    retainAmbiguous(message);
   }
 
   const entry = {
-    name,
-    sessionId,
-    role: role.name,
-    cwd,
-    tabId,
-    paneId,
-    workspace,
-    model,
-    effort,
-    parent: parentSessionId(),
-    startedAt: new Date().toISOString(),
-    argv: childArgs,
+    name, sessionId, role: role.name, cwd, tabId, paneId, workspace, model, effort,
+    parent: parentSessionId(), startedAt: baseEntry.startedAt, argv: childArgs,
   };
-  upsertChild(entry);
+  try { upsertChild(entry); }
+  catch (error) {
+    closeTabForRollback(tabId);
+    retainAmbiguous(`child '${name}' started but its registry update failed: ${error.message}`);
+  }
 
   console.log(JSON.stringify({
     ...entry,
@@ -604,7 +788,7 @@ function cmdResult(name, opts) {
 
 function cmdResume(name) {
   requireHerdr();
-  const entry = readRegistry().children.find((c) => c.name === name);
+  const entry = readRegistry({ strict: true }).children.find((c) => c.name === name);
   if (!entry) die(`'${name}' is not a subagent owned by this session`);
   if (!Array.isArray(entry.argv) || !entry.argv.every((arg) => typeof arg === "string")
     || typeof entry.sessionId !== "string" || typeof entry.cwd !== "string"
@@ -620,44 +804,112 @@ function cmdResume(name) {
   if (!isTrustedCwd(entry.cwd)) die(`${entry.cwd} is no longer trusted for Claude Code`);
   if (liveAgentNames().has(name)) die(`'${name}' is still live; message it instead of resuming`);
 
-  // Resume validation above is complete before this first mutating Herdr call.
-  const created = herdrJson([
-    "tab", "create",
-    "--workspace", callerWorkspace(),
-    "--cwd", entry.cwd,
-    "--label", name,
-    "--no-focus",
-  ]);
-  const tabId = created?.result?.tab?.tab_id;
-  const paneId = created?.result?.root_pane?.pane_id;
-  if (!paneId) {
-    if (tabId) herdr(["tab", "close", tabId], { allowFailure: true });
-    die(`Herdr did not return a root pane: ${JSON.stringify(created)}`);
-  }
-
-  // Replay the recorded loadout, swapping the fresh-session flag for a resume.
   const childArgs = replayArgv.filter((a, i, all) => {
     if (a === "--session-id") return false;
     return all[i - 1] !== "--session-id";
   });
-  const started = startAgentInPane(name, paneId, ["--resume", entry.sessionId, ...childArgs]);
-  if (!started?.result?.agent) {
-    herdr(["tab", "close", tabId], { allowFailure: true });
-    die(`could not resume '${name}'. Response: ${JSON.stringify(started)}`);
+  const workspace = callerWorkspace();
+  ensureOwnedNameClaim(entry); // migrates legacy registry ownership on first resume
+  const sessionClaim = claimSessionRun(entry);
+  if (!sessionClaim) {
+    const existing = readClaim("session", entry.sessionId);
+    die(`cannot resume '${name}': session ${entry.sessionId} is already claimed at ${existing?.path}; refusing to run one transcript twice`);
   }
-  const { stoppedAt, ...revived } = entry;
-  upsertChild({
-    ...revived, argv: replayArgv, tabId, paneId, resumedAt: new Date().toISOString(),
-  });
+
+  let tabId = null;
+  let paneId = null;
+  const failResume = (message, knownUnstarted) => {
+    closeTabForRollback(tabId);
+    const released = knownUnstarted ? releaseClaim(sessionClaim) : false;
+    let registryError = "";
+    if (!knownUnstarted) {
+      try {
+        upsertChild({
+          ...entry, tabId, paneId, startupUncertain: true, launchError: message,
+          sessionClaim: sessionClaim.path,
+        });
+      } catch (error) {
+        registryError = ` Diagnostic registry persistence also failed: ${error.message}.`;
+      }
+    }
+    die(knownUnstarted
+      ? released
+        ? message
+        : `${message} Startup was ruled out, but session ownership could not be released at ${sessionClaim.path}.`
+      : `${message} Session ownership retained at ${sessionClaim.path}.${registryError} Stop/inspect before recovery.`);
+  };
+
+  let created;
+  try {
+    created = herdrJson([
+      "tab", "create", "--workspace", workspace, "--cwd", entry.cwd,
+      "--label", name, "--no-focus",
+    ]);
+  } catch (error) {
+    failResume(`tab creation for resume '${name}' returned an ambiguous failure: ${error.message}`, false);
+  }
+  tabId = created?.result?.tab?.tab_id || null;
+  paneId = created?.result?.root_pane?.pane_id || null;
+  if (!paneId) failResume(`Herdr did not return a root pane: ${JSON.stringify(created)}`, true);
+
+  let started;
+  try {
+    started = startAgentInPane(name, paneId, ["--resume", entry.sessionId, ...childArgs]);
+  } catch (error) {
+    failResume(`agent resume for '${name}' returned an ambiguous failure: ${error.message}`, false);
+  }
+  if (!started?.result?.agent) {
+    failResume(
+      `could not resume '${name}'. Response: ${JSON.stringify(started)}`,
+      started?.error?.code === "agent_pane_busy",
+    );
+  }
+  const {
+    stoppedAt, startupUncertain, launchError, ownershipClaim, sessionClaim: oldSessionClaim,
+    ...revived
+  } = entry;
+  try {
+    upsertChild({
+      ...revived, argv: replayArgv, tabId, paneId, resumedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    failResume(`resumed child '${name}' but registry update failed: ${error.message}`, false);
+  }
   console.log(JSON.stringify({ name, sessionId: entry.sessionId, tabId, paneId, status: "resumed" }, null, 2));
 }
 
+function responseConfirmsAgentAbsent(response) {
+  return response?.error?.code === "agent_not_found";
+}
+
 function cmdStop(name) {
-  const entry = markStopped(name);
+  const entry = readRegistry({ strict: true }).children.find((c) => c.name === name);
   if (!entry) die(`'${name}' is not a subagent owned by this session (refusing to close a tab we did not create)`);
-  const tabId = entry.tabId
-    || herdrJson(["agent", "get", name], { allowFailure: true })?.result?.agent?.tab_id;
-  if (tabId) herdr(["tab", "close", tabId], { allowFailure: true });
+
+  const got = herdrJson(["agent", "get", name], { allowFailure: true });
+  const tabId = entry.tabId || got?.result?.agent?.tab_id || null;
+  let closureAccepted = responseConfirmsAgentAbsent(got) && !tabId;
+  if (tabId) {
+    const closed = herdrJson(["tab", "close", tabId], { allowFailure: true });
+    closureAccepted = Boolean(closed?.result)
+      || ["tab_not_found", "agent_not_found"].includes(closed?.error?.code);
+    if (!closureAccepted) {
+      const after = herdrJson(["agent", "get", name], { allowFailure: true });
+      closureAccepted = responseConfirmsAgentAbsent(after);
+    }
+  }
+  if (!closureAccepted) {
+    die(`could not confirm closure of '${name}'${tabId ? ` (${tabId})` : ""}; it was not marked stopped and its session claim was retained`);
+  }
+
+  // Ordering matters: only publish stopped after closure is confirmed. Publish
+  // before releasing run exclusion so a concurrent resume cannot start and then
+  // be overwritten by this stop operation.
+  markStopped(name);
+  const runClaim = typeof entry.sessionId === "string" ? readClaim("session", entry.sessionId) : null;
+  if (runClaim?.record?.parent === parentSessionId() && !releaseClaim(runClaim)) {
+    die(`'${name}' was closed and marked stopped, but its session claim could not be released at ${runClaim.path}`);
+  }
   console.log(`stopped ${name}${tabId ? ` (closed ${tabId})` : " (tab already gone)"} - resumable`);
 }
 
@@ -672,7 +924,22 @@ function cmdStopAll() {
 
 function cmdForget(name) {
   if (liveAgentNames().has(name)) die(`'${name}' is still live; stop it first`);
-  console.log(forgetChild(name) ? `forgot ${name}` : `'${name}' was not in this session's registry`);
+  const entry = readRegistry({ strict: true }).children.find((c) => c.name === name);
+  if (!entry) {
+    console.log(`'${name}' was not in this session's registry`);
+    return;
+  }
+  const runClaim = typeof entry.sessionId === "string" ? readClaim("session", entry.sessionId) : null;
+  if (runClaim) die(`'${name}' still has an unresolved session claim at ${runClaim.path}; stop it before forgetting ownership`);
+  const nameClaim = ensureOwnedNameClaim(entry);
+  if (!nameClaim || !releaseClaim(nameClaim)) {
+    die(`could not release name ownership for '${name}'${nameClaim?.path ? ` at ${nameClaim.path}` : ""}`);
+  }
+  // Release first: while the legacy registry entry remains, other parents still
+  // refuse the name. If registry persistence now fails, retry can safely
+  // reacquire the claim instead of leaving an ownerless orphan claim on disk.
+  const forgotten = forgetChild(name);
+  console.log(forgotten ? `forgot ${name}` : `'${name}' was not in this session's registry`);
 }
 
 function cmdRoles() {
@@ -920,26 +1187,31 @@ function parseArgs(argv) {
 }
 
 function main(argv = process.argv.slice(2)) {
-  const [command, ...rest] = argv;
-  const { opts, positional } = parseArgs(rest);
+  try {
+    const [command, ...rest] = argv;
+    const { opts, positional } = parseArgs(rest);
 
-  switch (command) {
-    case "spawn": cmdSpawn(opts); break;
-    case "list": cmdList(opts); break;
-    case "result": cmdResult(positional[0] || die("result needs a name"), opts); break;
-    case "resume": cmdResume(positional[0] || die("resume needs a name")); break;
-    case "stop": cmdStop(positional[0] || die("stop needs a name")); break;
-    case "stop-all": cmdStopAll(); break;
-    case "forget": cmdForget(positional[0] || die("forget needs a name")); break;
-    case "roles": cmdRoles(); break;
-    case "install": cmdInstall(); break;
-    case "uninstall": cmdUninstall(); break;
-    case "doctor": cmdDoctor(); break;
-    default:
-      console.error(
-        "usage: hs.mjs spawn|list|result|resume|stop|stop-all|forget|roles|install|uninstall|doctor",
-      );
-      process.exit(2);
+    switch (command) {
+      case "spawn": cmdSpawn(opts); break;
+      case "list": cmdList(opts); break;
+      case "result": cmdResult(positional[0] || die("result needs a name"), opts); break;
+      case "resume": cmdResume(positional[0] || die("resume needs a name")); break;
+      case "stop": cmdStop(positional[0] || die("stop needs a name")); break;
+      case "stop-all": cmdStopAll(); break;
+      case "forget": cmdForget(positional[0] || die("forget needs a name")); break;
+      case "roles": cmdRoles(); break;
+      case "install": cmdInstall(); break;
+      case "uninstall": cmdUninstall(); break;
+      case "doctor": cmdDoctor(); break;
+      default:
+        console.error(
+          "usage: hs.mjs spawn|list|result|resume|stop|stop-all|forget|roles|install|uninstall|doctor",
+        );
+        process.exitCode = 2;
+    }
+  } catch (error) {
+    console.error(`hs: ${error?.message ?? String(error)}`);
+    process.exitCode = 1;
   }
 }
 

@@ -91,13 +91,15 @@ Run by hand in workspace `wJ`. Every gate passed.
 One handle per child, serving as the Herdr agent name, the Claude session `--name`, and the
 registry key. Herdr constrains it to `[a-z][a-z0-9_-]{0,31}`.
 
-1. Guard `HERDR_ENV=1`, read `HERDR_WORKSPACE_ID`.
-2. `herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd <cwd> --label <name> --no-focus`.
-3. `herdr agent start <name> --kind claude --pane <root pane> -- --agent <role> --name <name>
+1. Guard `HERDR_ENV=1`, validate the role, loadout, cwd/add-dirs, task, and callback contract.
+2. Atomically claim the name and fresh session id under `~/.claude/herdr-subagents/claims/`.
+   Explicit duplicate names fail; generated names try stable numeric suffixes.
+3. `herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd <cwd> --label <name> --no-focus`.
+4. `herdr agent start <name> --kind claude --pane <root pane> -- --agent <role> --name <name>
    --session-id <uuid> --permission-mode auto --append-system-prompt-file <callback-contract>
    [--model <m>]`.
-4. Record ownership in `~/.claude/herdr-subagents/<parent-session-id>/registry.json`.
-5. Return the handle. Never block.
+5. Record ownership in the existing, compatible
+   `~/.claude/herdr-subagents/<parent-session-id>/registry.json`, then return the handle.
 6. With `--task`: the task is written to `<registry dir>/briefs/<name>.md` alongside the reply
    address, that directory is granted with `--add-dir`, and the child is seeded with a one-line
    positional prompt telling it to read the brief. Without `--task`: the child stays idle and the
@@ -124,8 +126,18 @@ and `bypassPermissions` are rejected before a Herdr tab is created.
 - **Bare role names collide.** `SendMessage` refused an ambiguous `scout` because a same-named
   session existed on another machine over Remote Control. Spawned handles now default to
   `<role>-<4 hex>`; pass `--name` for something meaningful.
+- **Ownership and launch are transactional.** Name claims are durable until `forget`; session-run
+  claims last until confirmed stop. Resume first migrates legacy registry-only ownership into the
+  claim layout and atomically claims the session, so concurrent processes cannot replay one
+  transcript twice. The old registry JSON remains the list/result/resume read path and schema.
+  Failures known to precede startup (local preparation, missing root pane, exhausted
+  `agent_pane_busy`) close any tab and release new claims. `agent_not_ready`, transport errors, and
+  other ambiguous start outcomes close what they can but retain claims plus a diagnostic registry
+  entry: recovery fails closed rather than guessing whether Claude began.
 - **Stopping must not forget the child.** Closing the tab ends the process, not the session, so
-  the registry entry is marked rather than deleted and `resume` can still replay it.
+  the registry entry is marked rather than deleted and `resume` can still replay it. `stop` marks
+  it only after tab closure succeeds or the agent is confirmed absent; an unconfirmed close keeps
+  both the old status and the session-run claim.
 - **The two completion signals have very different latency.** A child's own `SendMessage` reply
   arrived mid-turn, seconds after it finished, every time. The `notify_when_idle` notices for the
   same children arrived batched at the orchestrator's next turn boundary - one of them about 25

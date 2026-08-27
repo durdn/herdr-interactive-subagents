@@ -100,7 +100,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the toggle" });
 | --- | --- | --- | --- |
 | `agent` | string | required | Discoverable agent role |
 | `task` | string | required | Task prompt |
-| `name` | string | role name | Unique Herdr tab/widget handle; duplicates are suffixed |
+| `name` | string | role name | Unique Herdr tab/widget handle; explicit duplicates fail, defaults are suffixed |
 | `model` | string | role model | Model override |
 | `cwd` | string | role cwd | Child working directory |
 
@@ -114,7 +114,7 @@ subagent_message({ name: "scout", message: "Also inspect the middleware" });
 - **Finished:** resumes the original pi session with the exact snapshotted sandbox and reclaims the name; its result arrives asynchronously.
 - **Cancellation:** use `subagent_cancel({ name })` or `subagent_cancel_all({})`; manually closed Herdr tabs are also detected and removed from the widget.
 
-Name mappings live under the orchestrator session's `artifacts/<sessionId>/subagent-registry.json` and survive pi restarts.
+Name mappings live under the orchestrator session's `artifacts/<sessionId>/subagent-registry.json` and survive pi restarts. Atomic claim directories beside the registry reserve names and exclude concurrent transcript resumes across processes. Existing registry-only sessions remain readable; their first resume acquires the new run claim before Herdr is mutated. An ownership claim retained after an ambiguous launch intentionally blocks automatic retry until the external state is diagnosed.
 
 ### Questions
 

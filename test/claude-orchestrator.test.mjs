@@ -6,7 +6,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import {
   CALLBACK_PROMPT_PATH,
@@ -63,6 +63,22 @@ function run(fx, args, options = {}) {
     env: { ...fx.env, ...options.env },
     encoding: "utf8",
     timeout: 10_000,
+  });
+}
+
+function runAsync(fx, args, options = {}) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(process.execPath, [CLI, ...args], {
+      cwd: options.cwd || fx.project,
+      env: { ...fx.env, ...options.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status) => resolveRun({ status, stdout, stderr }));
   });
 }
 
@@ -222,7 +238,7 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
   it("rejects callback-incompatible roles and launch options before Herdr mutation", () => {
     for (const mode of [
       "missing-tool", "empty-tools", "denied-tool", "denied-glob", "bypass",
-      "bad-permission", "missing-address", "bad-effort", "missing-add-dir",
+      "bad-permission", "missing-address", "bad-effort", "missing-add-dir", "missing-name",
     ]) {
       const fx = fixture();
       const tools = mode === "missing-tool" ? "Read, Grep"
@@ -240,6 +256,7 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
       }
       if (mode === "bad-effort") args.push("--effort", "extreme");
       if (mode === "missing-add-dir") args.push("--add-dir", join(fx.dir, "missing"));
+      if (mode === "missing-name") args.push("--name");
       const result = run(fx, args, { env });
       assert.equal(result.status, 1, `${mode}: ${result.stdout} ${result.stderr}`);
       assert.match(result.stderr, /^hs: /);
@@ -247,16 +264,55 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     }
   });
 
-  it("cleans up a failed start and does not record ownership", () => {
+  it("fails closed when Herdr reports startup may have begun", () => {
     const fx = fixture();
     const result = run(fx, [
       "spawn", "--role", "scout", "--name", "broken", "--cwd", fx.project,
     ], { env: { HS_FAKE_START_FAILURE: "1" } });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /could not start 'broken'; tab w-test:t1 closed/);
+    assert.match(result.stderr, /Ownership retained for diagnosis/);
     assert.ok(calls(fx).some((call) => call[0] === "agent" && call[1] === "read"));
     assert.ok(calls(fx).some((call) => call[0] === "tab" && call[1] === "close"));
+    const child = registry(fx).children[0];
+    assert.equal(child.name, "broken");
+    assert.equal(child.startupUncertain, true);
+    assert.ok(existsSync(child.ownershipClaim));
+    assert.ok(existsSync(child.sessionClaim));
+
+    const duplicate = run(fx, [
+      "spawn", "--role", "scout", "--name", "broken", "--cwd", fx.project,
+    ]);
+    assert.equal(duplicate.status, 1);
+    assert.match(duplicate.stderr, /explicit name 'broken' is already owned/);
+  });
+
+  it("rolls back claims when pane-busy proves startup never began", () => {
+    const fx = fixture();
+    const failed = run(fx, [
+      "spawn", "--role", "scout", "--name", "retryable", "--cwd", fx.project,
+    ], { env: {
+      HS_FAKE_START_BUSY_ALWAYS: "1",
+      HS_SHELL_READY_TIMEOUT_MS: "5",
+    } });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /could not start 'retryable'/);
     assert.equal(existsSync(registryPath(fx)), false);
+
+    const retried = ok(run(fx, [
+      "spawn", "--role", "scout", "--name", "retryable", "--cwd", fx.project,
+    ]));
+    assert.equal(JSON.parse(retried.stdout).name, "retryable");
+  });
+
+  it("atomically rejects concurrent explicit-name spawns before duplicate Herdr mutation", async () => {
+    const fx = fixture();
+    const args = ["spawn", "--role", "scout", "--name", "one-owner", "--cwd", fx.project];
+    const results = await Promise.all([runAsync(fx, args), runAsync(fx, args)]);
+    assert.deepEqual(results.map((r) => r.status).sort(), [0, 1]);
+    assert.match(results.find((r) => r.status === 1).stderr, /explicit name 'one-owner' is already owned/);
+    assert.equal(calls(fx).filter((call) => call[0] === "tab" && call[1] === "create").length, 1);
+    assert.equal(registry(fx).children.length, 1);
   });
 
   it("lists live/stopped state, keeps stop resumable, resumes without replaying the seed, then forgets", () => {
@@ -291,6 +347,38 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     result = ok(run(fx, ["forget", "job"]));
     assert.match(result.stdout, /forgot job/);
     assert.deepEqual(registry(fx).children, []);
+  });
+
+  it("atomically excludes concurrent resumes of one Claude transcript", async () => {
+    const fx = fixture();
+    ok(run(fx, ["spawn", "--role", "worker", "--name", "resume-race", "--cwd", fx.project]));
+    ok(run(fx, ["stop", "resume-race"]));
+
+    const results = await Promise.all([
+      runAsync(fx, ["resume", "resume-race"]),
+      runAsync(fx, ["resume", "resume-race"]),
+    ]);
+    assert.deepEqual(results.map((r) => r.status).sort(), [0, 1]);
+    assert.match(results.find((r) => r.status === 1).stderr, /already claimed.*refusing to run one transcript twice/);
+    const resumeStarts = calls(fx).filter((args) =>
+      args[0] === "agent" && args[1] === "start" && args.includes("--resume"));
+    assert.equal(resumeStarts.length, 1);
+  });
+
+  it("does not mark stopped or release resume exclusion when closure is unconfirmed", () => {
+    const fx = fixture();
+    ok(run(fx, ["spawn", "--role", "worker", "--name", "close-fails", "--cwd", fx.project]));
+    const stopped = run(fx, ["stop", "close-fails"], { env: {
+      HS_FAKE_CLOSE_FAILURE: "1",
+      HS_FAKE_GET_FAILURE: "1",
+    } });
+    assert.equal(stopped.status, 1);
+    assert.match(stopped.stderr, /could not confirm closure/);
+    assert.equal(registry(fx).children[0].stoppedAt, undefined);
+
+    const resumed = run(fx, ["resume", "close-fails"]);
+    assert.equal(resumed.status, 1);
+    assert.match(resumed.stderr, /still live|already claimed/);
   });
 
   it("rejects malformed resume state before Herdr mutation", () => {

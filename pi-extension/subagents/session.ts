@@ -3,13 +3,15 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
+  rmSync,
   readFileSync,
   readSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 
 export interface SessionEntry {
   type: string;
@@ -117,14 +119,15 @@ export function loadoutSidecarPath(sessionFile: string): string {
   return `${sessionFile}.loadout.json`;
 }
 
-/** Persist a subagent's resolved sandbox loadout beside its session file. */
+/**
+ * Persist a subagent's resolved sandbox loadout beside its session file.
+ *
+ * This is part of the launch transaction, not a cache: without it the durable
+ * name cannot safely resume after completion. Let persistence errors abort the
+ * launch before any Herdr mutation instead of silently creating a dead handle.
+ */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
-  } catch {
-    // Best-effort: a missing snapshot only means resume will refuse, never that
-    // it launches unrestricted.
-  }
+  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
 }
 
 /** Read a subagent's loadout snapshot, or null if absent/unparseable. */
@@ -158,46 +161,215 @@ export interface NameRegistryEntry {
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
 
+export interface OwnershipClaim {
+  kind: "name" | "session";
+  key: string;
+  token: string;
+  path: string;
+}
+
+interface ClaimRecord {
+  version: 1;
+  kind: "name" | "session";
+  key: string;
+  token: string;
+  pid: number;
+  createdAt: string;
+  name?: string;
+  sessionFile?: string;
+}
+
 /** Path of the name registry for a given spawner session's artifact dir. */
 export function nameRegistryPath(artifactDir: string): string {
   return join(artifactDir, "subagent-registry.json");
 }
 
-/** Read a spawner session's name registry, or {} if absent/corrupt. */
-export function readNameRegistry(artifactDir: string): NameRegistry {
+function registryLockPath(artifactDir: string): string {
+  return join(artifactDir, "subagent-registry.lock");
+}
+
+function withRegistryLock<T>(artifactDir: string, run: () => T): T {
+  mkdirSync(artifactDir, { recursive: true });
+  const lock = registryLockPath(artifactDir);
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      mkdirSync(lock);
+      break;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST" || Date.now() >= deadline) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
   try {
-    const p = nameRegistryPath(artifactDir);
-    if (!existsSync(p)) return {};
+    return run();
+  } finally {
+    rmSync(lock, { recursive: true, force: true });
+  }
+}
+
+function readRegistryFile(artifactDir: string, strict = false): NameRegistry {
+  const p = nameRegistryPath(artifactDir);
+  if (!existsSync(p)) return {};
+  try {
     const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("registry root is not an object");
+    }
     return parsed as NameRegistry;
-  } catch {
+  } catch (error: any) {
+    if (strict) throw new Error(`Subagent registry is corrupt at ${p}: ${error?.message ?? String(error)}`);
     return {};
   }
 }
 
+/** Read a spawner session's legacy-compatible name registry. */
+export function readNameRegistry(artifactDir: string): NameRegistry {
+  return readRegistryFile(artifactDir);
+}
+
+function writeRegistryFile(artifactDir: string, registry: NameRegistry): void {
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${process.pid}-${randomUUID()}`;
+  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+  try {
+    renameSync(tmp, p);
+  } catch (error) {
+    try { rmSync(tmp, { force: true }); } catch {}
+    throw error;
+  }
+}
+
 /**
- * Register (or overwrite) a name → session mapping for a spawner session.
- * Writes atomically (temp file + rename) so a concurrent reader never sees a
- * partial registry.
+ * Register a name → session mapping without ever replacing another session.
+ * A small directory lock prevents concurrent read/modify/write loss while the
+ * JSON shape remains compatible with existing list/resume installations.
  */
 export function registerName(
   artifactDir: string,
   name: string,
   entry: NameRegistryEntry,
 ): void {
-  try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
+  withRegistryLock(artifactDir, () => {
+    const registry = readRegistryFile(artifactDir, true);
+    const existing = registry[name];
+    if (existing && existing.sessionFile !== entry.sessionFile) {
+      throw new Error(`Subagent name "${name}" is already registered to ${existing.sessionFile}`);
+    }
     registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
-  } catch {
-    // Best-effort: a failed registration only means resume-by-name won't find
-    // this subagent later; it never breaks the spawn itself.
+    writeRegistryFile(artifactDir, registry);
+  });
+}
+
+/** Remove only the exact mapping installed by a launch that never began. */
+export function unregisterName(
+  artifactDir: string,
+  name: string,
+  sessionFile: string,
+): void {
+  withRegistryLock(artifactDir, () => {
+    const registry = readRegistryFile(artifactDir, true);
+    if (registry[name]?.sessionFile !== sessionFile) return;
+    delete registry[name];
+    writeRegistryFile(artifactDir, registry);
+  });
+}
+
+function claimPath(artifactDir: string, kind: "name" | "session", key: string): string {
+  const digest = createHash("sha256").update(key).digest("hex");
+  return join(artifactDir, "subagent-claims", `${kind}s`, digest);
+}
+
+function tryClaim(
+  artifactDir: string,
+  kind: "name" | "session",
+  key: string,
+  details: Pick<ClaimRecord, "name" | "sessionFile">,
+): OwnershipClaim | null {
+  const path = claimPath(artifactDir, kind, key);
+  mkdirSync(dirname(path), { recursive: true });
+  try {
+    mkdirSync(path);
+  } catch (error: any) {
+    if (error?.code === "EEXIST") return null;
+    throw error;
   }
+
+  const token = randomUUID();
+  const record: ClaimRecord = {
+    version: 1,
+    kind,
+    key,
+    token,
+    pid: process.pid,
+    createdAt: new Date().toISOString(),
+    ...details,
+  };
+  try {
+    writeFileSync(join(path, "claim.json"), JSON.stringify(record, null, 2), "utf8");
+    return { kind, key, token, path };
+  } catch (error) {
+    rmSync(path, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** Atomically reserve a durable child name, including names from legacy registries. */
+export function tryClaimName(artifactDir: string, name: string): OwnershipClaim | null {
+  if (readRegistryFile(artifactDir, true)[name]) return null;
+  const claim = tryClaim(artifactDir, "name", name, { name });
+  if (!claim) return null;
+  // Close the migration race with an older process that registered after our first read.
+  if (readRegistryFile(artifactDir, true)[name]) {
+    releaseOwnershipClaim(claim);
+    return null;
+  }
+  return claim;
+}
+
+/** Atomically exclude every other process from running the same transcript. */
+export function tryClaimSession(
+  artifactDir: string,
+  sessionFile: string,
+  name: string,
+): OwnershipClaim | null {
+  return tryClaim(artifactDir, "session", resolveClaimKey(sessionFile), { name, sessionFile });
+}
+
+function resolveClaimKey(path: string): string {
+  // Avoid realpath: the session may not exist yet for a standalone launch.
+  // Windows paths are case-insensitive, so aliases differing only by case must
+  // still contend on the same transcript claim.
+  const absolute = resolve(path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+/** Release a claim only when its unguessable token still owns the directory. */
+export function releaseOwnershipClaim(claim: OwnershipClaim): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(join(claim.path, "claim.json"), "utf8"));
+    if (parsed?.token !== claim.token || parsed?.key !== claim.key) return false;
+    rmSync(claim.path, { recursive: true, force: true });
+    return true;
+  } catch {
+    // Idempotent release is important when cancellation and its aborted watcher
+    // finish concurrently. An absent directory no longer excludes anyone.
+    return !existsSync(claim.path);
+  }
+}
+
+/** Enumerate retained claims for diagnostics and tests. */
+export function readOwnershipClaims(artifactDir: string, kind: "name" | "session"): ClaimRecord[] {
+  const dir = join(artifactDir, "subagent-claims", `${kind}s`);
+  if (!existsSync(dir)) return [];
+  const records: ClaimRecord[] = [];
+  for (const child of readdirSync(dir)) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, child, "claim.json"), "utf8"));
+      if (parsed?.kind === kind && typeof parsed.key === "string") records.push(parsed);
+    } catch {}
+  }
+  return records;
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */

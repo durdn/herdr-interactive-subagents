@@ -1399,6 +1399,29 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("warns once per legacy Claude role and session with actionable migration guidance", () => {
+    const notifications: Array<{ message: string; type: string }> = [];
+    const context = (sessionId: string) => ({
+      sessionManager: { getSessionId: () => sessionId },
+      ui: { notify: (message: string, type: string) => notifications.push({ message, type }) },
+    } as any);
+
+    const sessionA = context("warning-session-a");
+    const sessionB = context("warning-session-b");
+    assert.equal(testApi.warnLegacyClaudeRoleOnce("legacy-a", { cli: "claude" }, sessionA), true);
+    assert.equal(testApi.warnLegacyClaudeRoleOnce("legacy-a", { cli: "claude" }, sessionA), false);
+    assert.equal(testApi.warnLegacyClaudeRoleOnce("legacy-b", { cli: "claude" }, sessionA), true);
+    assert.equal(testApi.warnLegacyClaudeRoleOnce("legacy-a", { cli: "claude" }, sessionB), true);
+    assert.equal(testApi.warnLegacyClaudeRoleOnce("native", {}, sessionA), false);
+
+    assert.equal(notifications.length, 3);
+    assert.ok(notifications.every((entry) => entry.type === "warning"));
+    assert.match(notifications[0].message, /deprecated cli: claude/i);
+    assert.match(notifications[0].message, /native Pi/i);
+    assert.match(notifications[0].message, /dedicated Claude orchestrator/i);
+    assert.match(notifications[0].message, /future major release/i);
+  });
+
   it("lists visible agents from discovery", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1422,6 +1445,33 @@ describe("subagent discovery", () => {
 
       assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
       assert.match(result.content[0].text, /visible-discovery-test-agent/);
+    });
+  });
+
+  it("marks legacy Claude roles deprecated in listing metadata and output", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "legacy-claude-listing-test-agent",
+        [
+          "name: legacy-claude-listing-test-agent",
+          "description: Legacy Claude fixture",
+          "cli: claude",
+        ].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((candidate) => candidate.name === "subagents_list");
+      const result = await tool.execute();
+      const listed = result.details.agents.find(
+        (agent: any) => agent.name === "legacy-claude-listing-test-agent",
+      );
+
+      assert.equal(listed.deprecated, true);
+      assert.match(listed.deprecation, /migrate this role to native Pi/i);
+      assert.match(result.content[0].text, /legacy-claude-listing-test-agent.*deprecated/i);
+      assert.match(result.content[0].text, /dedicated Claude orchestrator/i);
     });
   });
 

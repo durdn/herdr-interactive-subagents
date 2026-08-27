@@ -468,7 +468,7 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     assert.equal(existsSync(join(fx.home, ".claude", "commands", "subagent.md")), false);
   });
 
-  it("ships both import-safe script modules in the npm package", () => {
+  it("ships scripts, canonical catalog, and committed generated roles in the npm package", () => {
     const localNpm = process.env.npm_execpath
       || join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
     const hasNodeCli = existsSync(localNpm);
@@ -483,6 +483,22 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     assert.ok(names.includes("claude-plugin/scripts/hs.mjs"));
     assert.ok(names.includes("claude-plugin/scripts/hs-lib.mjs"));
     assert.ok(names.includes("claude-plugin/callback-prompt.md"));
+    assert.ok(names.includes("scripts/roles.mjs"));
+    assert.ok(names.includes("roles/catalog.json"));
+    assert.ok(names.includes("roles/README.md"));
+    assert.deepEqual(
+      names.filter((name) => name.startsWith("agents/") && name.endsWith(".md")).sort(),
+      ["agents/researcher.md", "agents/scout.md", "agents/worker.md"],
+    );
+    assert.deepEqual(
+      names.filter((name) => name.startsWith("claude-plugin/agents/") && name.endsWith(".md")).sort(),
+      [
+        "claude-plugin/agents/researcher.md",
+        "claude-plugin/agents/reviewer.md",
+        "claude-plugin/agents/scout.md",
+        "claude-plugin/agents/worker.md",
+      ],
+    );
     assert.equal(names.some((name) => name === "brief.txt" || name.startsWith("test/")), false);
   });
 });

@@ -79,6 +79,9 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const LEGACY_CLAUDE_WARNINGS_KEY = Symbol.for("pi-subagents/legacy-claude-warnings");
+const LEGACY_CLAUDE_DEPRECATION =
+  "cli: claude compatibility path; migrate this role to native Pi, or use the dedicated Claude orchestrator. It remains available in 4.x but will be removed in a future major release.";
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -157,6 +160,8 @@ interface AgentDefinition extends AgentDefaults {
 
 interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
+  deprecated?: true;
+  deprecation?: string;
 }
 
 /**
@@ -336,7 +341,13 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
         file.replace(/\.md$/, ""),
       );
       if (!parsed) continue;
-      agents.set(parsed.name, { ...parsed, source });
+      agents.set(parsed.name, {
+        ...parsed,
+        source,
+        ...(parsed.cli === "claude"
+          ? { deprecated: true as const, deprecation: LEGACY_CLAUDE_DEPRECATION }
+          : {}),
+      });
     }
   }
 
@@ -437,6 +448,31 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
+}
+
+function legacyClaudeWarningSet(sessionManager: object): Set<string> {
+  const globalState = globalThis as any;
+  const warnings: WeakMap<object, Set<string>> = globalState[LEGACY_CLAUDE_WARNINGS_KEY] ??=
+    new WeakMap<object, Set<string>>();
+  let roles = warnings.get(sessionManager);
+  if (!roles) {
+    roles = new Set<string>();
+    warnings.set(sessionManager, roles);
+  }
+  return roles;
+}
+
+function warnLegacyClaudeRoleOnce(
+  roleName: string,
+  agent: AgentDefaults | null,
+  ctx: Pick<ExtensionContext, "sessionManager" | "ui">,
+): boolean {
+  if (agent?.cli !== "claude") return false;
+  const warned = legacyClaudeWarningSet(ctx.sessionManager);
+  if (warned.has(roleName)) return false;
+  ctx.ui.notify(`Role "${roleName}" uses deprecated ${LEGACY_CLAUDE_DEPRECATION}`, "warning");
+  warned.add(roleName);
+  return true;
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -1229,6 +1265,7 @@ export const __test__ = {
   cancelAllRunningSubagents,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  warnLegacyClaudeRoleOnce,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1989,6 +2026,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const selectedAgentDefs = loadAgentDefaults(params.agent);
+        warnLegacyClaudeRoleOnce(params.agent, selectedAgentDefs, ctx);
+
         // Validate prerequisites (need mux + a session file to derive the
         // artifact dir that hosts this session's name registry).
         if (!isMuxAvailable()) {
@@ -2018,8 +2058,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A claim is then the first ownership mutation and always precedes the
         // first mutating Herdr call.
         try {
-          const defs = loadAgentDefaults(params.agent);
-          const { effectiveCwd } = resolveSubagentPaths(params, defs);
+          const { effectiveCwd } = resolveSubagentPaths(params, selectedAgentDefs);
           validateDirectory(effectiveCwd ?? ctx.cwd, "Subagent cwd");
         } catch (error: any) {
           const err = error?.message ?? String(error);
@@ -2226,7 +2265,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
           const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
+          const deprecation = a.deprecated ? ` [deprecated: ${a.deprecation}]` : "";
+          return `• ${a.name}${badge}${model}${deprecation}${desc}`;
         });
 
         return {
@@ -2245,7 +2285,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
           const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
+          const deprecation = a.deprecated
+            ? theme.fg("warning", ` [deprecated: ${a.deprecation}]`)
+            : "";
+          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${deprecation}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);
       },

@@ -6,13 +6,14 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
-// The test runner may itself be a restricted subagent. index.ts intentionally
+// The test runner may itself be a restricted subagent. agents.ts intentionally
 // captures these restrictions at import time, so import it with a clean
 // top-level-session environment and then restore the caller's values.
 const inheritedAllowed = process.env.PI_SUBAGENT_ALLOWED;
 const inheritedAgent = process.env.PI_SUBAGENT_AGENT;
 delete process.env.PI_SUBAGENT_ALLOWED;
 delete process.env.PI_SUBAGENT_AGENT;
+const agentPolicyModule = await import("../pi-extension/subagents/agents.ts");
 const subagentsModule = await import("../pi-extension/subagents/index.ts");
 restoreEnvVar("PI_SUBAGENT_ALLOWED", inheritedAllowed);
 restoreEnvVar("PI_SUBAGENT_AGENT", inheritedAgent);
@@ -1018,7 +1019,9 @@ describe("status.ts", () => {
 });
 
 describe("subagent discovery", () => {
-  const testApi = (subagentsModule as any).__test__;
+  // Agent definition/discovery/configuration policy is tested at its owning
+  // module boundary; index.ts contributes only its remaining launch helpers.
+  const testApi = { ...(subagentsModule as any).__test__, ...agentPolicyModule };
 
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
@@ -1195,7 +1198,6 @@ describe("subagent discovery", () => {
 
   it("accepts Windows absolute cwd values without joining them to the parent cwd", () => {
     const windowsCwd = "C:\\Users\\durdn\\dev\\herdr-interactive-subagents";
-    assert.equal(testApi.isAbsoluteSubagentPath(windowsCwd), true);
     assert.equal(
       testApi.resolveSubagentPaths(
         { agent: "worker", task: "fix it", cwd: windowsCwd },
@@ -1265,18 +1267,6 @@ describe("subagent discovery", () => {
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, undefined);
     });
-  });
-
-  it("resolves session mode from frontmatter (standalone default)", () => {
-    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
-    assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
-      "lineage-only",
-    );
-    assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "fork" }),
-      "fork",
-    );
   });
 
   it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {

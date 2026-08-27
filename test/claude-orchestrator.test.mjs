@@ -483,6 +483,8 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     assert.ok(names.includes("claude-plugin/scripts/hs.mjs"));
     assert.ok(names.includes("claude-plugin/scripts/hs-lib.mjs"));
     assert.ok(names.includes("claude-plugin/callback-prompt.md"));
+    assert.ok(names.includes("pi-extension/subagents/index.ts"));
+    assert.ok(names.includes("pi-extension/subagents/agents.ts"));
     assert.ok(names.includes("scripts/roles.mjs"));
     assert.ok(names.includes("roles/catalog.json"));
     assert.ok(names.includes("roles/README.md"));

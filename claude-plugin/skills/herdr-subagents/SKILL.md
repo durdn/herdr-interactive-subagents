@@ -73,8 +73,12 @@ this session; `--model` and `--effort` at spawn override the role. Raise effort 
 hard task, not by reflex — and note that Haiku ignores effort entirely.
 
 A project can add roles in `.claude/agents/` and a user in `~/.claude/agents/`; both shadow the
-bundled ones by name. `spawn` names the roles it knows when you ask for one it does not have, so
-even then you never need a lookup step first.
+bundled ones by name. A custom role's tool policy must allow `SendMessage`: an explicit `tools:`
+list must include it and `disallowedTools:` must not deny it, or `spawn` rejects the role before
+creating a tab. The launcher supplies the callback contract as an authoritative system prompt, so
+custom role bodies only need to define their work
+and result format. `spawn` names the roles it knows when you ask for one it does not have, so even
+then you never need a lookup step first.
 
 ## Choosing the working directory
 

@@ -5,7 +5,16 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+// The test runner may itself be a restricted subagent. index.ts intentionally
+// captures these restrictions at import time, so import it with a clean
+// top-level-session environment and then restore the caller's values.
+const inheritedAllowed = process.env.PI_SUBAGENT_ALLOWED;
+const inheritedAgent = process.env.PI_SUBAGENT_AGENT;
+delete process.env.PI_SUBAGENT_ALLOWED;
+delete process.env.PI_SUBAGENT_AGENT;
+const subagentsModule = await import("../pi-extension/subagents/index.ts");
+restoreEnvVar("PI_SUBAGENT_ALLOWED", inheritedAllowed);
+restoreEnvVar("PI_SUBAGENT_AGENT", inheritedAgent);
 
 import {
   getNewEntries,

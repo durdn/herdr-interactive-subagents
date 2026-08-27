@@ -59,8 +59,9 @@ Run by hand in workspace `wJ`. Every gate passed.
 ### Findings that shape the design
 
 - **A child reports back only when told to.** The second spike message asked it to "answer" and it
-  answered — into its own transcript, where the orchestrator never sees it. The reply contract has
-  to live in the role body, not in the per-task prompt.
+  answered — into its own transcript, where the orchestrator never sees it. The reply contract is
+  therefore an authoritative system prompt supplied by the launcher, independent of both the role
+  body and the per-task prompt.
 - **Parent session names drift.** Claude Code renamed the orchestrator mid-session from `cfg-69`
   to a topic-derived name. Never bake a parent name into a child. The child replies to the
   `from` address carried on the incoming message.
@@ -72,8 +73,9 @@ Run by hand in workspace `wJ`. Every gate passed.
   message's `from`. Writing it into a task brief the child reads at startup delivers task and
   address together, and collapses spawn-then-message into one call. `SendMessage` is still the
   channel for everything after the launch: steering, answers, follow-ups.
-- **New Herdr tabs run Windows PowerShell 5.1** (`$PSEdition = Desktop`). Prefer `--agent <role>`
-  over long quoted `--append-system-prompt` arguments so nothing depends on shell quoting.
+- **New Herdr tabs run Windows PowerShell 5.1** (`$PSEdition = Desktop`). Role identity stays in
+  `--agent <role>`, while the shared callback contract uses `--append-system-prompt-file`; neither
+  sends a long prompt through the shell's quoting layers.
 - **Permission class governs delivery, but `acceptEdits` is the wrong default.** It auto-accepts
   edits and then stops the child dead on every Bash and WebFetch approval, in a background tab
   nobody is watching — three of five children in the 2026-08-26 battery parked that way. Children
@@ -92,7 +94,8 @@ registry key. Herdr constrains it to `[a-z][a-z0-9_-]{0,31}`.
 1. Guard `HERDR_ENV=1`, read `HERDR_WORKSPACE_ID`.
 2. `herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd <cwd> --label <name> --no-focus`.
 3. `herdr agent start <name> --kind claude --pane <root pane> -- --agent <role> --name <name>
-   --session-id <uuid> --permission-mode auto [--model <m>]`.
+   --session-id <uuid> --permission-mode auto --append-system-prompt-file <callback-contract>
+   [--model <m>]`.
 4. Record ownership in `~/.claude/herdr-subagents/<parent-session-id>/registry.json`.
 5. Return the handle. Never block.
 6. With `--task`: the task is written to `<registry dir>/briefs/<name>.md` alongside the reply
@@ -100,9 +103,13 @@ registry key. Herdr constrains it to `[a-z][a-z0-9_-]{0,31}`.
    positional prompt telling it to read the brief. Without `--task`: the child stays idle and the
    orchestrator sends the task with `SendMessage`, with `notify_when_idle: true`.
 
-Every role body ends with the same reply contract: report the final summary to the sender of the
-task by `SendMessage`; if one decision materially blocks the work, send the question and stop
-rather than guessing.
+Every launch appends one authoritative callback system prompt: retain the address from the task
+brief's `Reply address:` or an assigning message's `from`, then report the result with exactly one
+`SendMessage`; if one decision materially blocks the work, send that question and stop rather than
+guessing. It applies equally to one-step briefs, taskless/two-step launches, and resumed sessions.
+Role bodies specify only the content of a useful result. A custom role's explicit `tools:` list
+must include `SendMessage`, and `disallowedTools:` must not deny it; callback-incompatible roles
+and `bypassPermissions` are rejected before a Herdr tab is created.
 
 ## What implementation added to those findings
 
@@ -112,8 +119,8 @@ rather than guessing.
   The working rule: `--cwd` a directory you already work in, `--add-dir` everything else.
 - **Herdr launches the child by typing a PowerShell line** (`Start-Process -FilePath claude
   -ArgumentList '...'`) into the tab's shell, which on Windows is PowerShell 5.1. Its quoting
-  survived a JSON `--settings` argument intact, but this is the reason roles are passed as
-  `--agent <name>` rather than as a long `--append-system-prompt`.
+  survived a JSON `--settings` argument intact, but prompts still travel by file: role identity
+  uses `--agent <name>` and the shared contract uses `--append-system-prompt-file`.
 - **Bare role names collide.** `SendMessage` refused an ambiguous `scout` because a same-named
   session existed on another machine over Remote Control. Spawned handles now default to
   `<role>-<4 hex>`; pass `--name` for something meaningful.

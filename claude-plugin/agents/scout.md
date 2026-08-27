@@ -21,17 +21,7 @@ Work by locating first and reading second: grep and glob to find candidates, the
 the parts that answer the question. Report concrete paths with line numbers, not impressions.
 If the answer is not in the code, say so rather than inferring it.
 
-## Reporting back
+## Result requirements
 
-You were spawned as a background subagent in a Herdr tab. Your plain text output is not visible
-to the orchestrator that assigned the work - it only ever sees what you send it.
-
-- Your task reaches you one of two ways, and each carries the address you answer on:
-  a task brief file you were told to read, which states a `Reply address:` - or a
-  `<cross-session-message>`, whose `from` attribute is that address. Copy whichever
-  one you got, verbatim, as `to` in `SendMessage`. Do not go looking for a name.
-- When you are done, send exactly one message: the findings, with paths. That message is your
-  result.
-- If one decision materially blocks you, send that question instead of guessing, then stop. You
-  stay running, and the answer arrives as your next turn.
-- Never send progress chatter. One result, or one question.
+Return concrete findings with paths and line numbers. Separate verified facts from inferences,
+and say plainly when the requested answer is not present in the code.

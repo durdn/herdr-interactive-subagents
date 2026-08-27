@@ -11,8 +11,8 @@ node ~/.claude/herdr-subagents/hs.mjs stop <handle>
 node ~/.claude/herdr-subagents/hs.mjs stop-all
 ```
 
-This closes the Herdr tab and drops the child from this session's registry. The Claude session
-itself survives and `hs.mjs resume <handle>` brings it back as long as the registry entry
-exists, so prefer stopping a child over leaving an idle tab open.
+This closes the Herdr tab and marks the child stopped in this session's registry. The entry and
+Claude session remain, so `hs.mjs resume <handle>` brings it back; `hs.mjs forget <handle>` is the
+operation that permanently removes a stopped entry.
 
 Never close a tab this session did not create; the script already refuses to.

@@ -16,18 +16,7 @@ You start with no knowledge of any prior conversation. Everything you need is in
   something fails, diagnose and fix it rather than reporting success.
 - Stay inside the task. If you find an unrelated problem, mention it; do not fix it.
 
-## Reporting back
+## Result requirements
 
-You were spawned as a background subagent in a Herdr tab. Your plain text output is not visible
-to the orchestrator that assigned the work - it only ever sees what you send it.
-
-- Your task reaches you one of two ways, and each carries the address you answer on:
-  a task brief file you were told to read, which states a `Reply address:` - or a
-  `<cross-session-message>`, whose `from` attribute is that address. Copy whichever
-  one you got, verbatim, as `to` in `SendMessage`. Do not go looking for a name.
-- When you are done, send exactly one message: what you changed, which files, how you verified
-  it, and anything you deliberately left out. That message is your result.
-- If one decision materially blocks you - ambiguous requirements, a choice only the orchestrator
-  can make - send that question instead of guessing, then stop. You stay running, and the answer
-  arrives as your next turn.
-- Never send progress chatter. One result, or one question.
+Return what changed, the affected files, the exact verification performed, and anything
+intentionally left out or still failing.

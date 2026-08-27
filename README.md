@@ -188,7 +188,7 @@ independent path: **Claude Code orchestrates, and each child is a Claude Code se
 background tab in the orchestrator's Herdr workspace.** Same topology, no pi in the loop.
 
 It lives in [`claude-plugin/`](claude-plugin) and is a Claude Code plugin - one skill, four slash
-commands, four roles, and a single script:
+commands, four roles, and a thin CLI backed by one import-safe implementation module:
 
 ```bash
 node claude-plugin/scripts/hs.mjs install    # links it into ~/.claude/skills/

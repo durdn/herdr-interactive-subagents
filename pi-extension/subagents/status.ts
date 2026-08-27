@@ -223,7 +223,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
-    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotState: "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
     currentKind: initialKind,
@@ -476,11 +476,7 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
   }
 
   if (snapshot.kind === "waiting") {
-    const problem = snapshot.statusLabel && snapshot.statusLabel !== "done"
-      ? ` (${snapshot.statusLabel})`
-      : snapshot.statusLabel === "done"
-        ? " (done)"
-        : "";
+    const problem = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatWaitingDetail(snapshot)}${problem}.`);
   }
 

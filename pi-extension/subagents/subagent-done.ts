@@ -15,7 +15,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -108,6 +108,19 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+}
+
+function writeJsonAtomically(path: string, value: unknown): void {
+  const tempPath = `${path}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(value));
+    renameSync(tempPath, path);
+  } catch (error) {
+    try {
+      unlinkSync(tempPath);
+    } catch {}
+    throw error;
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -249,14 +262,11 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (errorInfo && sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
+          writeJsonAtomically(`${sessionFile}.exit`, {
+            type: "error",
+            errorMessage: errorInfo.errorMessage,
+            stopReason: errorInfo.stopReason,
+          });
         } catch {
           // Best effort — even without the sidecar, watcher's session-file
           // fallback can still recover the errorMessage.
@@ -373,7 +383,7 @@ export default function (pi: ExtensionAPI) {
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      writeJsonAtomically(`${sessionFile}.ask`, askData);
 
       return {
         content: [

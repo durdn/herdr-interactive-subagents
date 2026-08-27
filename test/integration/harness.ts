@@ -17,7 +17,6 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
-  unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -107,8 +106,6 @@ export interface TestEnv {
   dir: string;
   /** Panes created during the test (cleaned up automatically) */
   surfaces: string[];
-  /** Temp files to clean up */
-  tempFiles: string[];
 }
 
 /**
@@ -138,7 +135,7 @@ export function createTestEnv(): TestEnv {
     }
   }
 
-  return { dir, surfaces: [], tempFiles: [] };
+  return { dir, surfaces: [] };
 }
 
 /**
@@ -148,11 +145,6 @@ export function cleanupTestEnv(env: TestEnv): void {
   for (const surface of env.surfaces) {
     try {
       closeSurface(surface);
-    } catch {}
-  }
-  for (const file of env.tempFiles) {
-    try {
-      unlinkSync(file);
     } catch {}
   }
   try {
@@ -300,11 +292,4 @@ export function sleep(ms: number): Promise<void> {
 
 export function uniqueId(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-}
-
-/**
- * Register a temp file for cleanup.
- */
-export function trackTempFile(env: TestEnv, path: string): void {
-  env.tempFiles.push(path);
 }

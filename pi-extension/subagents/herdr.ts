@@ -298,6 +298,18 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
+function consumeExitSidecar(sessionFile: string): PollResult | null {
+  try {
+    const exitFile = `${sessionFile}.exit`;
+    if (!existsSync(exitFile)) return null;
+    const result = interpretExitSidecar(JSON.parse(readFileSync(exitFile, "utf8")));
+    rmSync(exitFile, { force: true });
+    return result;
+  } catch {
+    return null;
+  }
+}
+
 function isPaneNotFoundError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const candidate = error as { message?: unknown; stdout?: unknown; stderr?: unknown };
@@ -307,7 +319,17 @@ function isPaneNotFoundError(error: unknown): boolean {
   return /pane_not_found|pane\s+[^\s]+\s+not found/i.test(text);
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar, isPaneNotFoundError };
+function findCompletionExitCode(screen: string, sentinel = "__SUBAGENT_DONE_"): number | null {
+  const escaped = sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = screen.match(new RegExp(`^${escaped}(\\d+)__\\r?$`, "m"));
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+export const __pollForExitTest__ = {
+  findCompletionExitCode,
+  interpretExitSidecar,
+  isPaneNotFoundError,
+};
 
 /**
  * Poll until the subagent exits. Pi's lifecycle sidecars provide the fast path;
@@ -320,6 +342,7 @@ export async function pollForExit(
     interval: number;
     sessionFile?: string;
     sentinelFile?: string;
+    completionSentinel?: string;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
@@ -329,14 +352,8 @@ export async function pollForExit(
     if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
 
     if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
+      const sidecarResult = consumeExitSidecar(options.sessionFile);
+      if (sidecarResult) return sidecarResult;
     }
 
     if (options.sentinelFile) {
@@ -347,18 +364,12 @@ export async function pollForExit(
 
     try {
       const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) return { reason: "sentinel", exitCode: Number.parseInt(match[1], 10) };
+      const exitCode = findCompletionExitCode(screen, options.completionSentinel);
+      if (exitCode != null) return { reason: "sentinel", exitCode };
     } catch (error) {
       if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+        const sidecarResult = consumeExitSidecar(options.sessionFile);
+        if (sidecarResult) return sidecarResult;
       }
       if (isPaneNotFoundError(error)) {
         return {

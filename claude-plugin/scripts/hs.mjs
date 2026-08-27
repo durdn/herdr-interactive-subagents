@@ -19,7 +19,7 @@ import {
   symlinkSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // This file lives at <plugin>/scripts/hs.mjs, so the plugin root is one up.
@@ -213,7 +213,7 @@ function readRegistry() {
 
 function writeRegistry(reg) {
   const p = registryPath();
-  mkdirSync(join(p, ".."), { recursive: true });
+  mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, JSON.stringify(reg, null, 2));
 }
 
@@ -644,7 +644,7 @@ function writeShim({ quiet = false } = {}) {
   const p = shimPath();
   const body = shimBody();
   if (existsSync(p) && readFileSync(p, "utf8") === body) return false;
-  mkdirSync(join(p, ".."), { recursive: true });
+  mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, body);
   if (!quiet) console.log("shim: " + p + " -> " + fwd(join(PLUGIN_DIR, "scripts", "hs.mjs")));
   return true;
@@ -690,7 +690,7 @@ function deployCommands() {
     // and both shells accept them on Windows, so this avoids a mixed-separator path.
     const root = PLUGIN_DIR.split("\\").join("/");
     const body = readFileSync(c.source, "utf8").split("<plugin>").join(root);
-    mkdirSync(join(c.dest, ".."), { recursive: true });
+    mkdirSync(dirname(c.dest), { recursive: true });
     if (existsSync(c.dest) && !readFileSync(c.dest, "utf8").includes(COMMAND_MARKER)) {
       console.log(`skipped ${c.dest} (not ours - remove it by hand to deploy)`);
       continue;
@@ -728,7 +728,7 @@ function cmdInstall() {
   } else if (existsSync(link) || target) {
     die(`${link} already exists${target ? ` (points at ${target})` : ""}; remove it first`);
   } else {
-    mkdirSync(join(link, ".."), { recursive: true });
+    mkdirSync(dirname(link), { recursive: true });
     // "junction" is the only link type Windows grants without elevation.
     symlinkSync(want, link, process.platform === "win32" ? "junction" : "dir");
     console.log(`installed: ${link} -> ${want}`);

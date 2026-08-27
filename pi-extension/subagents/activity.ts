@@ -251,28 +251,19 @@ function clearActiveState(activity: SubagentActivityState): void {
 }
 
 function refreshActiveScope(activity: SubagentActivityState): void {
-  if (activity.toolActive) {
+  let scope: SubagentActivityScope | undefined;
+  if (activity.toolActive) scope = "tool";
+  else if (activity.providerActive) scope = "provider";
+  else if (activity.turnActive) scope = "turn";
+  else if (activity.agentActive) scope = "agent";
+
+  if (scope) {
     activity.phase = "active";
-    activity.activeScope = "tool";
-    return;
+    activity.activeScope = scope;
+  } else {
+    delete activity.activeScope;
+    delete activity.activeSince;
   }
-  if (activity.providerActive) {
-    activity.phase = "active";
-    activity.activeScope = "provider";
-    return;
-  }
-  if (activity.turnActive) {
-    activity.phase = "active";
-    activity.activeScope = "turn";
-    return;
-  }
-  if (activity.agentActive) {
-    activity.phase = "active";
-    activity.activeScope = "agent";
-    return;
-  }
-  delete activity.activeScope;
-  delete activity.activeSince;
 }
 
 function markActive(

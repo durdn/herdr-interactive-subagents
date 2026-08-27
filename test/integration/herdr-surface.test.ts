@@ -29,7 +29,6 @@ import {
   closeSurface,
   sleep,
   uniqueId,
-  trackTempFile,
   waitForFile,
   waitForScreen,
   type TestEnv,

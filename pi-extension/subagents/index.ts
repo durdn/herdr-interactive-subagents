@@ -11,9 +11,11 @@ import {
   existsSync,
   mkdirSync,
   copyFileSync,
+  renameSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -557,6 +559,20 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
+/** Convert a display name into a safe, readable artifact filename stem. */
+function artifactStem(name: string | undefined, fallback = "subagent"): string {
+  return (name ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || fallback;
+}
+
+function createCompletionSentinel(): string {
+  return `__SUBAGENT_DONE_${randomBytes(12).toString("hex")}_`;
+}
+
 const statusConfig = loadStatusConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
@@ -650,6 +666,7 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  completionSentinel: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -877,13 +894,7 @@ function applySandboxToParts(
   if (loadout.identity) {
     const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
     const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = opts.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const spPath = join(opts.artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+    const spPath = join(opts.artifactDir, `context/${artifactStem(opts.name)}-sysprompt-${spTimestamp}.md`);
     mkdirSync(dirname(spPath), { recursive: true });
     writeFileSync(spPath, loadout.identity, "utf8");
     parts.push(flag, shellEscape(spPath));
@@ -1182,6 +1193,9 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 }
 
 export const __test__ = {
+  artifactStem,
+  createCompletionSentinel,
+  consumePendingQuestionFile,
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
@@ -1243,6 +1257,7 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
+  const completionSentinel = createCompletionSentinel();
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = resolveEffectiveModel(params, agentDefs, ctx.model);
@@ -1316,7 +1331,7 @@ async function launchSubagent(
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
-    const sentinelFile = `/tmp/pi-claude-${id}-done`;
+    const sentinelFile = `/tmp/pi-claude-${randomBytes(12).toString("hex")}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
     const cmdParts: string[] = [];
@@ -1342,24 +1357,12 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '${completionSentinel}'$?'__'`;
 
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptName = `${artifactStem(params.name)}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
+    sendLongCommand(surface, command, { scriptPath: launchScriptFile });
 
     const running: RunningSubagent = {
       id,
@@ -1372,6 +1375,7 @@ async function launchSubagent(
       launchScriptFile,
       cli: "claude",
       sentinelFile,
+      completionSentinel,
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
@@ -1455,13 +1459,7 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+    const artifactName = `context/${artifactStem(params.name)}-${timestamp}.md`;
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
@@ -1481,23 +1479,10 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+  const command = `${piCommand}; echo '${completionSentinel}'$?'__'`;
+  const launchScriptName = `${artifactStem(params.name)}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  sendLongCommand(surface, command, { scriptPath: launchScriptFile });
 
   const running: RunningSubagent = {
     id,
@@ -1509,6 +1494,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    completionSentinel,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1546,26 +1532,57 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+interface PendingQuestion {
+  name?: string;
+  agent?: string;
+  question: string;
+}
+
+/** Atomically claim one question file, retaining malformed input for diagnosis. */
+function consumePendingQuestionFile(askFile: string, runningId: string): PendingQuestion | null {
+  const claimedFile = `${askFile}.processing-${process.pid}-${runningId}-${Date.now()}`;
+  try {
+    renameSync(askFile, claimedFile);
+  } catch {
+    return null;
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(readFileSync(claimedFile, "utf8"));
+  } catch {
+    try {
+      renameSync(claimedFile, `${askFile}.invalid-${Date.now()}`);
+    } catch {}
+    return null;
+  }
+
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    typeof (payload as { question?: unknown }).question !== "string" ||
+    !(payload as { question: string }).question.trim()
+  ) {
+    try {
+      renameSync(claimedFile, `${askFile}.invalid-${Date.now()}`);
+    } catch {}
+    return null;
+  }
+
+  try {
+    unlinkSync(claimedFile);
+  } catch {}
+  return payload as PendingQuestion;
+}
+
 /**
  * Detect an `ask_question` signal from a still-running subagent and notify the
- * orchestrator without ending the subagent. Each subagent has its own
- * `${sessionFile}.ask` file and its own watcher, so parallel questions from
- * multiple subagents are delivered independently. The file is deleted after
- * delivery so it fires once per question (a subagent may ask again later).
+ * orchestrator without ending the subagent. Claiming by rename prevents a new
+ * question from being deleted while the current one is read.
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
-  const askFile = `${running.sessionFile}.ask`;
-  let payload: any = null;
-  try {
-    if (!existsSync(askFile)) return;
-    payload = JSON.parse(readFileSync(askFile, "utf-8"));
-  } catch {
-    // Malformed/partway-written file — drop it and move on.
-  }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+  const payload = consumePendingQuestionFile(`${running.sessionFile}.ask`, running.id);
+  if (!payload) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
@@ -1599,6 +1616,7 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      completionSentinel: running.completionSentinel,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1618,8 +1636,11 @@ async function watchSubagent(
       }
 
       if (!summary) {
+        const completionLine = `${running.completionSentinel}${result.exitCode}__`;
         summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
+          .split(/\r?\n/)
+          .filter((line) => line !== completionLine)
+          .join("\n")
           .trimEnd();
       }
 
@@ -2212,6 +2233,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
+        const completionSentinel = createCompletionSentinel();
 
         // Resolve the name to its session file via this session's registry.
         const parentArtifactDir = getArtifactDir(
@@ -2290,12 +2312,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeMsgFile = join(
             artifactDir,
             "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+            `${artifactStem(name, "resume")}-${msgTimestamp}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, message, "utf8");
@@ -2329,27 +2346,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '${completionSentinel}'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+          `${artifactStem(name, "resume")}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+        sendLongCommand(surface, command, { scriptPath: launchScriptFile });
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2361,6 +2364,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          completionSentinel,
           interactive,
           statusState: createStatusState({
             source: "pi",

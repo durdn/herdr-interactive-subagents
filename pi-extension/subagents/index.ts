@@ -131,6 +131,14 @@ const SubagentParams = Type.Object({
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
+  budgetMin: Type.Optional(
+    Type.Number({
+      description:
+        "Optional wall-clock budget in minutes. A child still running when the budget expires is " +
+        "cancelled exactly as subagent_cancel would, and the result delivered to you starts with " +
+        "`over budget: <n> min` followed by whatever the child last said. Omit for no budget.",
+    }),
+  ),
 });
 
 /**
@@ -365,13 +373,16 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "overBudget"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+
+  // The budget marker must lead the delivered text, so it is handed over as-is.
+  if (result.overBudget) return result.summary;
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -410,6 +421,8 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+  /** Set when the run was cut short by its `budgetMin`. */
+  overBudget?: boolean;
 }
 
 /**
@@ -445,6 +458,10 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Wall-clock budget in minutes, from the spawn call. Absent means unbounded. */
+  budgetMin?: number;
+  /** Set by the budget timer before it cancels, so the watcher marks the result. */
+  overBudget?: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -983,6 +1000,8 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
+  startBudgetTimer,
+  watchSubagent,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -1201,6 +1220,7 @@ async function launchSubagent(
       sentinelFile,
       completionSentinel,
       interactive: effectiveInteractive,
+      budgetMin: params.budgetMin,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1369,6 +1389,7 @@ async function launchSubagent(
     activityFile,
     completionSentinel,
     interactive: effectiveInteractive,
+    budgetMin: params.budgetMin,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1479,11 +1500,45 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/**
+ * Arm a subagent's wall-clock budget. On expiry the child is cancelled through
+ * the same path `subagent_cancel` uses; the watcher then turns that abort into
+ * an over-budget result rather than a plain cancellation. No budget, no timer.
+ */
+function startBudgetTimer(
+  running: RunningSubagent,
+  cancel: (target: RunningSubagent) => unknown = cancelRunningSubagent,
+): ReturnType<typeof setTimeout> | undefined {
+  if (!running.budgetMin || running.budgetMin <= 0) return undefined;
+  const timer = setTimeout(() => {
+    running.overBudget = true;
+    cancel(running);
+  }, running.budgetMin * 60_000);
+  timer.unref?.();
+  return timer;
+}
+
+/** Whatever the child last said, for a result assembled without a clean exit. */
+function lastAssistantText(running: RunningSubagent): string {
+  try {
+    if (running.cli === "claude") {
+      return running.sentinelFile && existsSync(running.sentinelFile)
+        ? readFileSync(running.sentinelFile, "utf-8").trim()
+        : "";
+    }
+    if (!existsSync(running.sessionFile)) return "";
+    return findLastAssistantMessage(getNewEntries(running.sessionFile, 0)) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const budgetTimer = startBudgetTimer(running);
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -1597,6 +1652,20 @@ async function watchSubagent(
     }
     runningSubagents.delete(running.id);
 
+    if (running.overBudget) {
+      const said = lastAssistantText(running);
+      return {
+        name,
+        task,
+        summary: `over budget: ${running.budgetMin} min` + (said ? `\n\n${said}` : ""),
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: "over budget",
+        overBudget: true,
+        sessionFile,
+      };
+    }
+
     if (signal.aborted) {
       return {
         name,
@@ -1616,6 +1685,8 @@ async function watchSubagent(
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
     };
+  } finally {
+    if (budgetTimer) clearTimeout(budgetTimer);
   }
 }
 

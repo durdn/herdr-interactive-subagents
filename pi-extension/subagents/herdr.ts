@@ -12,19 +12,25 @@ import { dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-function herdrBin(): string {
-  return process.env.HERDR_BIN_PATH?.trim() || "herdr";
+function herdrCommand(): [string, string[]] {
+  const configured = process.env.HERDR_BIN_PATH?.trim();
+  // A JS executable makes a portable no-model test double possible, especially
+  // on Windows where execFile cannot run a .cmd wrapper without a shell.
+  if (configured?.endsWith(".mjs")) return [process.execPath, [configured]];
+  return [configured || "herdr", []];
 }
 
 function runHerdr(args: string[]): string {
-  return execFileSync(herdrBin(), args, {
+  const [bin, prefix] = herdrCommand();
+  return execFileSync(bin, [...prefix, ...args], {
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
   });
 }
 
 async function runHerdrAsync(args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync(herdrBin(), args, {
+  const [bin, prefix] = herdrCommand();
+  const { stdout } = await execFileAsync(bin, [...prefix, ...args], {
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
   });

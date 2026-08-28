@@ -103,6 +103,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the toggle" });
 | `name` | string | role name | Unique Herdr tab/widget handle; explicit duplicates fail, defaults are suffixed |
 | `model` | string | role model | Model override |
 | `cwd` | string | role cwd | Child working directory |
+| `budgetMin` | number | none | Wall-clock budget in minutes; an over-budget child is cancelled and its result arrives marked `over budget: <n> min` |
 
 ### Message or resume
 

@@ -56,6 +56,14 @@ if (args[0] === "agent" && args[1] === "start") {
   state.live = [...(state.live || []).filter((item) => item.name !== name), agent];
   json({ result: { agent } });
 }
+if (args[0] === "pane" && args[1] === "get") {
+  const pane = args[2] || "";
+  json({ result: { pane: { pane_id: pane, tab_id: pane.replace(":p", ":t") } } });
+}
+if (args[0] === "pane" && args[1] === "read") {
+  console.log("fake child screen");
+  process.exit(0);
+}
 if (args[0] === "agent" && args[1] === "read") {
   console.log("fake child screen");
   process.exit(0);

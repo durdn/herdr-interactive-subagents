@@ -1981,7 +1981,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
+  it("exposes a debloated schema: agent+task required, name/model/cwd/budgetMin optional, no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1991,8 +1991,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "budgetMin", "cwd", "model", "name", "task"],
+      "only agent/task/name/model/cwd/budgetMin should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -2856,6 +2856,113 @@ describe("herdr.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+  });
+});
+
+describe("subagent budget", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const runningMap = testApi.runningSubagents as Map<string, any>;
+  const saved: Record<string, string | undefined> = {};
+
+  before(() => {
+    for (const key of ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_PANE_ID", "HERDR_BIN_PATH"]) {
+      saved[key] = process.env[key];
+    }
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_WORKSPACE_ID = "w-test";
+    process.env.HERDR_PANE_ID = "w-test:p0";
+    process.env.HERDR_BIN_PATH = fileURLToPath(new URL("./fixtures/fake-herdr.mjs", import.meta.url));
+  });
+
+  after(() => {
+    for (const [key, value] of Object.entries(saved)) restoreEnvVar(key, value);
+    runningMap.clear();
+  });
+
+  function child(dir: string, overrides: Record<string, unknown> = {}) {
+    return {
+      id: "budget-1", name: "Worker", task: "do the thing", surface: "w-test:p9",
+      startTime: Date.now(), sessionFile: join(dir, "child.jsonl"),
+      completionSentinel: "__SUBAGENT_DONE_TEST_", interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      ...overrides,
+    };
+  }
+
+  /** A Claude child whose sentinel is already on disk: the watcher sees it finished. */
+  function finished(dir: string, overrides: Record<string, unknown> = {}) {
+    const sentinelFile = join(dir, "done");
+    writeFileSync(sentinelFile, "wired the toggle up");
+    return child(dir, { cli: "claude", sentinelFile, ...overrides });
+  }
+
+  async function watched(target: any, signal = new AbortController().signal) {
+    runningMap.set(target.id, target);
+    return await testApi.watchSubagent(target, signal);
+  }
+
+  async function inTempDir(run: (dir: string) => Promise<void>) {
+    const dir = createTestDir();
+    try {
+      await run(dir);
+    } finally {
+      runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("arms no timer and changes nothing when budgetMin is absent", async () => {
+    await inTempDir(async (dir) => {
+      const target = finished(dir);
+      assert.equal(testApi.startBudgetTimer(target), undefined);
+
+      const result = await watched(target);
+
+      assert.equal(result.summary, "wired the toggle up");
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.overBudget, undefined);
+      assert.match(
+        testApi.resolveResultPresentation(result, "Worker"),
+        /^Sub-agent "Worker" completed/,
+      );
+    });
+  });
+
+  it("delivers the normal result for a child that finishes inside its budget", async () => {
+    await inTempDir(async (dir) => {
+      const target = finished(dir, { budgetMin: 5 });
+
+      const result = await watched(target);
+
+      assert.equal(result.summary, "wired the toggle up");
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.overBudget, undefined);
+      assert.equal(target.overBudget, undefined);
+    });
+  });
+
+  it("cancels a child that runs past its budget and marks the delivered result", async () => {
+    await inTempDir(async (dir) => {
+      const abortController = new AbortController();
+      // 0.002 min = 120ms, and the fake Herdr never shows a completion sentinel.
+      const target = child(dir, {
+        sessionFile: createSessionFile(dir, [USER_MSG, ASSISTANT_MSG]),
+        abortController,
+        budgetMin: 0.002,
+      });
+
+      const result = await watched(target, abortController.signal);
+
+      assert.equal(result.overBudget, true);
+      assert.equal(result.exitCode, 1);
+      assert.equal(result.error, "over budget");
+      assert.equal(abortController.signal.aborted, true);
+      assert.equal(runningMap.size, 0);
+      assert.ok(result.summary.startsWith("over budget: 0.002 min"));
+      assert.match(result.summary, /Here is my plan/);
+      // The parent's steer is the marked summary verbatim, marker first.
+      assert.equal(testApi.resolveResultPresentation(result, "Worker"), result.summary);
     });
   });
 });

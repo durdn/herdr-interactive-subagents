@@ -107,22 +107,17 @@ function requireObject(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function validateFiniteNumber(object: Record<string, unknown>, fieldName: string): string | null {
-  return Number.isFinite(object[fieldName]) ? null : `${fieldName} must be finite`;
-}
-
-function validateOptionalFiniteNumber(object: Record<string, unknown>, fieldName: string): string | null {
+function validateNumber(
+  object: Record<string, unknown>,
+  fieldName: string,
+  integer = false,
+  optional = false,
+): string | null {
   const value = object[fieldName];
-  return value == null || Number.isFinite(value) ? null : `${fieldName} must be finite when present`;
-}
-
-function validateInteger(object: Record<string, unknown>, fieldName: string): string | null {
-  return Number.isInteger(object[fieldName]) ? null : `${fieldName} must be an integer`;
-}
-
-function validateOptionalInteger(object: Record<string, unknown>, fieldName: string): string | null {
-  const value = object[fieldName];
-  return value == null || Number.isInteger(value) ? null : `${fieldName} must be an integer when present`;
+  if (optional && value == null) return null;
+  const valid = integer ? Number.isInteger(value) : Number.isFinite(value);
+  const requirement = integer ? "an integer" : "finite";
+  return valid ? null : `${fieldName} must be ${requirement}${optional ? " when present" : ""}`;
 }
 
 function validateBoolean(object: Record<string, unknown>, fieldName: string): string | null {
@@ -161,18 +156,18 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   }
 
   const validationError = [
-    validateFiniteNumber(object, "createdAt"),
-    validateFiniteNumber(object, "updatedAt"),
-    validateInteger(object, "sequence"),
+    validateNumber(object, "createdAt"),
+    validateNumber(object, "updatedAt"),
+    validateNumber(object, "sequence", true),
     validateBoolean(object, "agentActive"),
     validateBoolean(object, "turnActive"),
     validateBoolean(object, "providerActive"),
     validateBoolean(object, "toolActive"),
-    validateOptionalFiniteNumber(object, "activeSince"),
-    validateOptionalFiniteNumber(object, "waitingSince"),
-    validateOptionalInteger(object, "turnIndex"),
-    validateOptionalFiniteNumber(object, "toolStartedAt"),
-    validateOptionalFiniteNumber(object, "toolEndedAt"),
+    validateNumber(object, "activeSince", false, true),
+    validateNumber(object, "waitingSince", false, true),
+    validateNumber(object, "turnIndex", true, true),
+    validateNumber(object, "toolStartedAt", false, true),
+    validateNumber(object, "toolEndedAt", false, true),
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
@@ -373,6 +368,21 @@ export function createSubagentActivityRecorder(params: {
     disable();
   }
 
+  function markAgentActive(latestEvent: "before_agent_start" | "agent_start"): void {
+    record(latestEvent, (current, observedAt) => {
+      current.agentActive = true;
+      markActive(current, "agent", observedAt);
+    }, "immediate");
+  }
+
+  function markWaiting(latestEvent: "agent_end" | "ask_question"): void {
+    record(latestEvent, (current, observedAt) => {
+      clearActiveState(current);
+      current.phase = "waiting";
+      current.waitingSince = observedAt;
+    }, "immediate");
+  }
+
   return {
     sessionStart() {
       record("session_start", (current) => {
@@ -385,23 +395,13 @@ export function createSubagentActivityRecorder(params: {
       record("input", () => {}, "immediate");
     },
     beforeAgentStart() {
-      record("before_agent_start", (current, observedAt) => {
-        current.agentActive = true;
-        markActive(current, "agent", observedAt);
-      }, "immediate");
+      markAgentActive("before_agent_start");
     },
     agentStart() {
-      record("agent_start", (current, observedAt) => {
-        current.agentActive = true;
-        markActive(current, "agent", observedAt);
-      }, "immediate");
+      markAgentActive("agent_start");
     },
     agentEndWaiting() {
-      record("agent_end", (current, observedAt) => {
-        clearActiveState(current);
-        current.phase = "waiting";
-        current.waitingSince = observedAt;
-      }, "immediate");
+      markWaiting("agent_end");
     },
     agentEndDone() {
       markDone("agent_end");
@@ -485,14 +485,7 @@ export function createSubagentActivityRecorder(params: {
       }, "immediate");
     },
     askQuestion() {
-      // The subagent paused to ask the orchestrator a question. Park it in the
-      // "waiting" phase (do NOT disable the recorder) so the status widget shows
-      // it as waiting and recording resumes when the answer arrives.
-      record("ask_question", (current, observedAt) => {
-        clearActiveState(current);
-        current.phase = "waiting";
-        current.waitingSince = observedAt;
-      }, "immediate");
+      markWaiting("ask_question");
     },
     sessionShutdown(reason) {
       if (reason === "quit") markDone("session_shutdown");

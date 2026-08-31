@@ -26,6 +26,23 @@ const ROLE_DIRS = [
 // retry in startAgentInPane; they are not a guess at how long that takes.
 const SHELL_READY_MS = Number(process.env.HS_SHELL_READY_DELAY_MS || 600);
 const SHELL_READY_TIMEOUT_MS = Number(process.env.HS_SHELL_READY_TIMEOUT_MS || 30000);
+const HERDR_TIMEOUT_MIN_MS = 3000; // `herdr agent start --timeout` wants more than this,
+const HERDR_TIMEOUT_MAX_MS = 300000; // and at most this. Both are its own limits, not ours.
+const validTimeout = (value, fallback) => {
+  const ms = Number(value);
+  return Number.isFinite(ms) && ms > HERDR_TIMEOUT_MIN_MS && ms <= HERDR_TIMEOUT_MAX_MS
+    ? Math.round(ms)
+    : fallback;
+};
+// What `agent start --timeout` bounds is DETECTION, not startup. On a loaded box
+// an Opus child with the full plugin set is still undetected well past the 60s
+// this used to hardcode, while the child itself runs fine - so the deadline is
+// raised, it is settable, and reaching it is never taken as proof that nothing
+// started (see confirmAgentPresent).
+const AGENT_START_TIMEOUT_MS = validTimeout(process.env.HS_AGENT_START_TIMEOUT_MS, 90000);
+// --no-wait still has to let `agent start` type the command line and answer;
+// this is how long that costs, not how long a child takes to come up.
+const NO_WAIT_TIMEOUT_MS = validTimeout(process.env.HS_NO_WAIT_TIMEOUT_MS, 5000);
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
 // This is deliberately supplied separately from every role. A role defines what
@@ -83,18 +100,47 @@ function sleepSync(ms) {
 // 600ms it used to wait - so ask Herdr rather than guess: retry for as long as
 // it says the pane is busy, and hand any other outcome back to the caller to
 // report. agent_not_ready is NOT retried; that child started and is blocked.
-function startAgentInPane(name, paneId, agentArgs) {
+function startAgentInPane(name, paneId, agentArgs, detectionTimeoutMs = AGENT_START_TIMEOUT_MS) {
   const deadline = Date.now() + SHELL_READY_TIMEOUT_MS;
   for (;;) {
     sleepSync(SHELL_READY_MS);
     const started = herdrJson(
-      ["agent", "start", name, "--kind", "claude", "--pane", paneId, "--timeout", "60000",
-        "--", ...agentArgs],
+      ["agent", "start", name, "--kind", "claude", "--pane", paneId,
+        "--timeout", String(detectionTimeoutMs), "--", ...agentArgs],
       { allowFailure: true },
     );
     if (started?.result?.agent) return started;
     if (started?.error?.code !== "agent_pane_busy" || Date.now() >= deadline) return started;
   }
+}
+
+/**
+ * Herdr's detection wait is advisory. A child can be live in `agent list` while
+ * `agent start` reports it never came up - four of five failed spawns in the
+ * field were exactly that - so ask the agent registry before believing it.
+ *
+ * Herdr assigns the agent NAME only when `agent start` succeeds, so a child that
+ * missed detection is nameless there: `agent get <name>` answers agent_not_found
+ * for a session that is sitting idle in its tab. Its pane is the handle that
+ * still resolves, and we have it from `tab create`.
+ */
+function confirmAgentPresent(name, paneId) {
+  const byName = herdrJson(["agent", "get", name], { allowFailure: true });
+  if (byName?.result?.agent) return byName.result.agent;
+  if (!paneId) return null;
+  const byPane = herdrJson(["agent", "get", paneId], { allowFailure: true });
+  return byPane?.result?.agent || null;
+}
+
+function clampStartTimeout(raw, fallback) {
+  if (raw === undefined) return fallback;
+  if (raw === true) die("--startup-timeout needs a value in milliseconds");
+  const ms = validTimeout(raw, null);
+  if (ms === null) {
+    die(`--startup-timeout must be more than ${HERDR_TIMEOUT_MIN_MS} and at most `
+      + `${HERDR_TIMEOUT_MAX_MS} ms`);
+  }
+  return ms;
 }
 
 // -- context ---------------------------------------------------------------
@@ -565,9 +611,30 @@ function extraDirs(opts, role) {
   return raw.map((d) => resolve(d.trim()));
 }
 
+const SPAWN_USAGE = [
+  "usage: hs.mjs spawn --role <name> [options]",
+  "",
+  "  --role <name>          required; the loadout to launch (see: hs.mjs roles)",
+  "  --task <text>          the whole task; newlines and quotes are fine",
+  "  --task-file <path>     read the task from a file instead of the command line",
+  "  --name <handle>        [a-z][a-z0-9_-]{0,31}; default <role>-<4 hex>",
+  "  --cwd <dir>            the child's working directory; must be Claude-trusted",
+  "  --add-dir <dir>        one more readable directory; repeat the flag for more",
+  "  --model <alias>        override the role's model (haiku, sonnet, opus, ...)",
+  "  --effort <level>       low|medium|high|xhigh|max; overrides the role",
+  "  --permission-mode <m>  default auto; bypassPermissions is rejected",
+  `  --startup-timeout <ms> detection wait; default ${AGENT_START_TIMEOUT_MS}, max ${HERDR_TIMEOUT_MAX_MS}`,
+  "  --no-wait              return as soon as the child is launched, before Herdr",
+  "                         detects it - use this when spawning a batch in one call",
+];
+
 function cmdSpawn(opts) {
+  if (opts.help) {
+    console.log(SPAWN_USAGE.join("\n"));
+    return;
+  }
   requireHerdr();
-  if (!opts.role) die("spawn needs --role <name> (see: hs.mjs roles)");
+  if (!opts.role) die(["spawn needs --role <name>", "", ...SPAWN_USAGE].join("\n"));
   const role = requireRole(opts.role);
   const permissionMode = opts.permissionMode || role["permission-mode"] || "auto";
   validateCallbackRole(role, permissionMode);
@@ -588,6 +655,13 @@ function cmdSpawn(opts) {
   if (effort && !["low", "medium", "high", "xhigh", "max"].includes(effort)) {
     die(`unknown effort '${effort}' (low, medium, high, xhigh, max)`);
   }
+  // Detection is the only thing this call waits on, and the skill asks for a
+  // whole fan-out in one shell call. --no-wait returns as soon as the command
+  // is typed, so five spawns cost seconds instead of five detection windows.
+  const noWait = Boolean(opts.noWait);
+  const detectionTimeout = clampStartTimeout(
+    opts.startupTimeout, noWait ? NO_WAIT_TIMEOUT_MS : AGENT_START_TIMEOUT_MS,
+  );
   const task = taskText(opts);
   if (task && !replyAddress()) {
     die([
@@ -653,24 +727,38 @@ function cmdSpawn(opts) {
     name, sessionId, role: role.name, cwd, workspace, model, effort,
     parent: parentSessionId(), startedAt: new Date().toISOString(), argv: childArgs,
   };
-  const retainAmbiguous = (message) => {
+  const registerStarting = (launchError) => {
     const entry = {
       ...baseEntry, tabId, paneId, startupUncertain: true,
-      launchError: message, ownershipClaim: nameClaim.path, sessionClaim: sessionClaim.path,
+      ...(launchError ? { launchError } : {}),
+      ownershipClaim: nameClaim.path, sessionClaim: sessionClaim.path,
     };
-    let registryError = "";
     try {
       upsertChild(entry);
+      return "";
     } catch (error) {
-      registryError = ` Diagnostic registry persistence also failed: ${error.message}.`;
+      return ` Diagnostic registry persistence also failed: ${error.message}.`;
     }
-    die(
-      `${message} Ownership retained for diagnosis at ${nameClaim.path}; `
-      + `transcript claim: ${sessionClaim.path}.${registryError} Stop/inspect before recovery.`,
-    );
+  };
+  // Name the recovery. "Stop/inspect before recovery" left every reader in the
+  // field guessing, and both of them burned a name rather than risk the wrong
+  // command.
+  const retainAmbiguous = (message) => {
+    const registryError = registerStarting(message);
+    die([
+      message,
+      "    It stays registered as 'starting', so this session still owns it:",
+      "      hs.mjs list                     # does Herdr see it running?",
+      // By pane, not by name: an undetected child has no name in Herdr yet.
+      `      herdr agent read ${paneId || name} --source detection --lines 40`,
+      `      hs.mjs stop ${name}               # if it is dead; then 'resume ${name}' to retry it,`,
+      `                                      # or 'forget ${name}' to free the name`,
+      `    Ownership: ${nameClaim.path}; transcript claim: ${sessionClaim.path}.${registryError}`,
+    ].join("\n"));
   };
   const rollbackUnstarted = (message) => {
     closeTabForRollback(tabId);
+    if (existsSync(registryPath())) forgetChild(name);
     const sessionReleased = releaseClaim(sessionClaim);
     const nameReleased = releaseClaim(nameClaim);
     if (briefPath) rmSync(briefPath, { force: true });
@@ -696,49 +784,70 @@ function cmdSpawn(opts) {
   paneId = created?.result?.root_pane?.pane_id || null;
   if (!paneId) rollbackUnstarted(`Herdr did not return a root pane: ${JSON.stringify(created)}`);
 
+  // Register BEFORE the detection wait, not after it. A shell tool that killed
+  // this process mid-wait used to leave a live child with no registry entry at
+  // all - an orphan that `list`, `result` and `stop` each denied existed.
+  registerStarting(null);
+
   let started;
   try {
-    started = startAgentInPane(name, paneId, [...seed, ...childArgs]);
+    started = startAgentInPane(name, paneId, [...seed, ...childArgs], detectionTimeout);
   } catch (error) {
-    closeTabForRollback(tabId);
     retainAmbiguous(`agent start for '${name}' returned an ambiguous failure: ${error.message}`);
   }
-  const agent = started?.result?.agent;
+  // Herdr's own wait is advisory, so ask the agent registry before believing
+  // it, and leave the tab open when the answer is ambiguous: closing it is what
+  // killed four children out of five that had in fact started fine.
+  const agent = started?.result?.agent || confirmAgentPresent(name, paneId);
   if (!agent) {
+    // agent_pane_busy is the one outcome that proves nothing was typed into the
+    // pane. Any other outcome, a timeout included, may have left a live child.
     const knownUnstarted = started?.error?.code === "agent_pane_busy";
     let screen = "";
     try {
-      screen = herdr(["agent", "read", name, "--source", "detection", "--lines", "30"], {
+      screen = herdr(["agent", "read", paneId || name, "--source", "detection", "--lines", "30"], {
         allowFailure: true,
       }).stdout || "";
     } catch {}
     const message = [
-      `could not start '${name}'; tab ${tabId} closed.`,
+      knownUnstarted
+        ? `could not start '${name}'; its pane never reached a shell prompt, so tab ${tabId} was closed.`
+        : `could not confirm '${name}' started within ${detectionTimeout} ms; tab ${tabId} is still `
+          + "open and the child may well be running.",
       `    ${started?.error?.message || JSON.stringify(started)}`,
       ...screen.split(/\r?\n/).filter(Boolean).slice(-12).map((l) => `    | ${l}`),
     ].join("\n");
     if (knownUnstarted) rollbackUnstarted(message);
-    closeTabForRollback(tabId);
-    retainAmbiguous(message);
+    if (!noWait) retainAmbiguous(message);
   }
 
   const entry = {
     name, sessionId, role: role.name, cwd, tabId, paneId, workspace, model, effort,
     parent: parentSessionId(), startedAt: baseEntry.startedAt, argv: childArgs,
+    // Only --no-wait reaches here undetected; keep it visible to `list`.
+    ...(agent ? {} : {
+      startupUncertain: true,
+      ownershipClaim: nameClaim.path,
+      sessionClaim: sessionClaim.path,
+    }),
   };
+  // The child is running by now, so a registry failure is a bookkeeping problem.
+  // Report it; do not close the tab and throw the child's work away over it.
   try { upsertChild(entry); }
   catch (error) {
-    closeTabForRollback(tabId);
     retainAmbiguous(`child '${name}' started but its registry update failed: ${error.message}`);
   }
 
+  const reporting = briefPath
+    ? `task delivered; "${name}" reports back on its own as a cross-session message. Do not poll.`
+    : `idle - send the task with SendMessage to "${name}" (add notify_when_idle: true).`;
   console.log(JSON.stringify({
     ...entry,
     brief: briefPath,
-    status: agent.agent_status,
-    next: briefPath
-      ? `task delivered; "${name}" reports back on its own as a cross-session message. Do not poll.`
-      : `idle - send the task with SendMessage to "${name}" (add notify_when_idle: true).`,
+    status: agent?.agent_status || "starting",
+    next: agent ? reporting : `booting in tab ${tabId}, not detected yet. ${briefPath
+      ? "It reads its brief and reports back on its own; do not poll."
+      : "Wait for it to reach 'hs.mjs list' before addressing it with SendMessage."}`,
   }, null, 2));
 }
 
@@ -746,12 +855,26 @@ function cmdList(opts) {
   const reg = readRegistry();
   const live = new Map();
   const res = herdrJson(["agent", "list"], { allowFailure: true });
-  for (const a of res?.result?.agents || []) if (a.name) live.set(a.name, a);
+  const byPane = new Map();
+  for (const a of res?.result?.agents || []) {
+    if (a.name) live.set(a.name, a);
+    if (a.pane_id) byPane.set(a.pane_id, a);
+  }
+  // The two sources used to disagree in silence: an empty list here while a
+  // spawn refused the same name as "already live". Say what Herdr can see.
+  const workspace = process.env.HERDR_WORKSPACE_ID;
+  const unowned = [...live.values()].filter((a) =>
+    (!workspace || a.workspace_id === workspace)
+    && a.pane_id !== process.env.HERDR_PANE_ID // never offer to adopt the caller
+    && !reg.children.some((c) => c.name === a.name));
 
   const rows = reg.children.map((c) => ({
     name: c.name,
     role: c.role,
-    status: live.get(c.name)?.agent_status || (c.stoppedAt ? "stopped" : "gone"),
+    // A child that missed detection is live but nameless in Herdr; its pane is
+    // what still identifies it, so `starting` resolves once it is really up.
+    status: (live.get(c.name) || byPane.get(c.paneId))?.agent_status
+      || (c.stoppedAt ? "stopped" : c.startupUncertain ? "starting" : "gone"),
     tab: c.tabId,
     cwd: c.cwd,
     sessionId: c.sessionId,
@@ -759,11 +882,20 @@ function cmdList(opts) {
   }));
 
   if (opts.json) {
-    console.log(JSON.stringify(rows, null, 2));
+    console.log(JSON.stringify(opts.all ? { owned: rows, unowned } : rows, null, 2));
     return;
   }
+  const alsoLive = () => {
+    if (!unowned.length) return;
+    console.log(
+      `\nalso live in ${workspace || "this Herdr"}, not owned by this session: `
+      + `${unowned.map((a) => `${a.name} (${a.tab_id})`).join(", ")}`
+      + "\n  adopt one this session launched: hs.mjs adopt <name>",
+    );
+  };
   if (!rows.length) {
     console.log("no subagents owned by this session");
+    alsoLive();
     return;
   }
   const pad = (s, n) => String(s).padEnd(n);
@@ -771,6 +903,7 @@ function cmdList(opts) {
   for (const r of rows) {
     console.log(`${pad(r.name, 20)}${pad(r.role, 14)}${pad(r.status, 10)}${pad(r.tab, 10)}${r.cwd}`);
   }
+  alsoLive();
 }
 
 function cmdResult(name, opts) {
@@ -786,8 +919,12 @@ function cmdResult(name, opts) {
   console.log(lines > 0 ? text.split(/\r?\n/).slice(-lines).join("\n") : text);
 }
 
-function cmdResume(name) {
+function cmdResume(name, opts = {}) {
   requireHerdr();
+  const noWait = Boolean(opts.noWait);
+  const detectionTimeout = clampStartTimeout(
+    opts.startupTimeout, noWait ? NO_WAIT_TIMEOUT_MS : AGENT_START_TIMEOUT_MS,
+  );
   const entry = readRegistry({ strict: true }).children.find((c) => c.name === name);
   if (!entry) die(`'${name}' is not a subagent owned by this session`);
   if (!Array.isArray(entry.argv) || !entry.argv.every((arg) => typeof arg === "string")
@@ -819,7 +956,8 @@ function cmdResume(name) {
   let tabId = null;
   let paneId = null;
   const failResume = (message, knownUnstarted) => {
-    closeTabForRollback(tabId);
+    // Same rule as spawn: only a ruled-out startup earns a closed tab.
+    if (knownUnstarted) closeTabForRollback(tabId);
     const released = knownUnstarted ? releaseClaim(sessionClaim) : false;
     let registryError = "";
     if (!knownUnstarted) {
@@ -836,7 +974,14 @@ function cmdResume(name) {
       ? released
         ? message
         : `${message} Startup was ruled out, but session ownership could not be released at ${sessionClaim.path}.`
-      : `${message} Session ownership retained at ${sessionClaim.path}.${registryError} Stop/inspect before recovery.`);
+      : [
+        message,
+        `    It stays registered as 'starting' in tab ${tabId || "(none)"}; session ownership retained.`,
+        `      hs.mjs list                                  # does Herdr see it running?`,
+        `      herdr agent read ${paneId || name} --source detection --lines 40`,
+        `      hs.mjs stop ${name}                            # if it is dead - releases the session`,
+        `    Transcript claim: ${sessionClaim.path}.${registryError}`,
+      ].join("\n"));
   };
 
   let created;
@@ -854,13 +999,17 @@ function cmdResume(name) {
 
   let started;
   try {
-    started = startAgentInPane(name, paneId, ["--resume", entry.sessionId, ...childArgs]);
+    started = startAgentInPane(
+      name, paneId, ["--resume", entry.sessionId, ...childArgs], detectionTimeout,
+    );
   } catch (error) {
     failResume(`agent resume for '${name}' returned an ambiguous failure: ${error.message}`, false);
   }
-  if (!started?.result?.agent) {
+  const resumed = started?.result?.agent || confirmAgentPresent(name, paneId);
+  if (!resumed && !noWait) {
     failResume(
-      `could not resume '${name}'. Response: ${JSON.stringify(started)}`,
+      `could not confirm '${name}' resumed within ${detectionTimeout} ms. `
+      + `Response: ${JSON.stringify(started)}`,
       started?.error?.code === "agent_pane_busy",
     );
   }
@@ -871,11 +1020,15 @@ function cmdResume(name) {
   try {
     upsertChild({
       ...revived, argv: replayArgv, tabId, paneId, resumedAt: new Date().toISOString(),
+      ...(resumed ? {} : { startupUncertain: true }),
     });
   } catch (error) {
     failResume(`resumed child '${name}' but registry update failed: ${error.message}`, false);
   }
-  console.log(JSON.stringify({ name, sessionId: entry.sessionId, tabId, paneId, status: "resumed" }, null, 2));
+  console.log(JSON.stringify({
+    name, sessionId: entry.sessionId, tabId, paneId,
+    status: resumed ? "resumed" : "starting",
+  }, null, 2));
 }
 
 function responseConfirmsAgentAbsent(response) {
@@ -940,6 +1093,66 @@ function cmdForget(name) {
   // reacquire the claim instead of leaving an ownerless orphan claim on disk.
   const forgotten = forgetChild(name);
   console.log(forgotten ? `forgot ${name}` : `'${name}' was not in this session's registry`);
+}
+
+/**
+ * Re-register a live Herdr agent this session already owns by name claim. The
+ * gap it closes: a spawn whose process was killed between claiming the name and
+ * recording the child, which left a running child that `list`, `result` and
+ * `stop` all denied existed. Ownership is the claim, never the tab, so this
+ * cannot be used to seize another session's child.
+ */
+function cmdAdopt(name, opts = {}) {
+  requireHerdr();
+  const claim = readClaim("name", name);
+  const existing = readRegistry().children.find((c) => c.name === name);
+  const agent = confirmAgentPresent(name, opts.pane || existing?.paneId);
+  if (!agent) {
+    die(`'${name}' is not a live Herdr agent; there is nothing to adopt. `
+      + "If Herdr never named it, pass its pane: adopt <name> --pane <pane_id> (herdr pane list)");
+  }
+
+  if (claim?.record && claim.record.parent !== parentSessionId()) {
+    die(`'${name}' is claimed by parent session ${claim.record.parent}; refusing to adopt another session's child`);
+  }
+  if (!claim && !existing) {
+    die(`'${name}' carries no ownership claim from this session, so it was not launched here. `
+      + `Close it with: herdr tab close ${agent.tab_id || "<tab_id>"}`);
+  }
+
+  const sessionId = agent.agent_session?.value || existing?.sessionId || claim?.record?.sessionId;
+  if (!sessionId) die(`Herdr reports no Claude session id for '${name}' yet; retry once it is detected`);
+  if (existing?.sessionId && existing.sessionId !== sessionId) {
+    die(`'${name}' is running session ${sessionId}, but this session owns ${existing.sessionId}; `
+      + "that tab is not the child we launched");
+  }
+  const role = opts.role || existing?.role;
+  if (!role) die("adopt needs --role <name> when there is no registry entry to read it from");
+  requireRole(role);
+
+  const { startupUncertain, launchError, stoppedAt, ...kept } = existing || {};
+  const entry = {
+    ...kept,
+    name, sessionId, role,
+    cwd: agent.cwd || kept.cwd || process.cwd(),
+    tabId: agent.tab_id || kept.tabId || null,
+    paneId: agent.pane_id || kept.paneId || null,
+    workspace: agent.workspace_id || kept.workspace || callerWorkspace(),
+    parent: parentSessionId(),
+    startedAt: kept.startedAt || new Date().toISOString(),
+    adoptedAt: new Date().toISOString(),
+  };
+  if (!claim) claimNewName(name, sessionId); // best effort; the entry is the record
+  claimSessionRun(entry); // no-op when the killed spawn already claimed it
+  upsertChild(entry);
+  console.log(JSON.stringify({
+    ...entry,
+    status: agent.agent_status,
+    next: Array.isArray(entry.argv)
+      ? `adopted; list/result/stop/resume now see "${name}".`
+      : `adopted; list/result/stop now see "${name}". No recorded argv, so it cannot be resumed `
+        + "after a stop - read its answer with 'hs.mjs result' first.",
+  }, null, 2));
 }
 
 function cmdRoles() {
@@ -1107,7 +1320,40 @@ function cmdUninstall() {
   }
 }
 
-function cmdDoctor() {
+/**
+ * The one check that would have caught the field failures: every static check
+ * stayed green through a session where four spawns in five reported a startup
+ * that had in fact happened. Time a real one instead of asserting around it.
+ */
+function probeSpawn(check) {
+  const cli = fileURLToPath(new URL("./hs.mjs", import.meta.url));
+  const name = `hs-doctor-${randomUUID().slice(0, 6)}`;
+  const run = (args) => spawnSync(process.execPath, [cli, ...args], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024,
+  });
+  const startedAt = Date.now();
+  const spawned = run(["spawn", "--role", "scout", "--model", "haiku", "--name", name]);
+  const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+  let status = null;
+  try { status = JSON.parse(spawned.stdout).status; } catch { /* reported below */ }
+
+  if (spawned.status === 0 && status && status !== "starting") {
+    check(true, `real spawn detected in ${seconds}s (budget ${AGENT_START_TIMEOUT_MS} ms)`);
+  } else if (spawned.status === 0) {
+    check(false, `real spawn launched but undetected after ${seconds}s `
+      + `(budget ${AGENT_START_TIMEOUT_MS} ms; raise HS_AGENT_START_TIMEOUT_MS)`);
+  } else {
+    check(false, `real spawn failed after ${seconds}s: `
+      + `${(spawned.stderr || spawned.stdout || "").trim().split(/\r?\n/)[0] || "no output"}`);
+  }
+  const stopped = run(["stop", name]);
+  run(["forget", name]);
+  if (stopped.status !== 0) {
+    console.log(`note  probe child '${name}' may still be open: ${(stopped.stderr || "").trim()}`);
+  }
+}
+
+function cmdDoctor(opts = {}) {
   let failed = false;
   const check = (ok, message) => {
     console.log(`${ok ? "ok  " : "FAIL"}  ${message}`);
@@ -1156,6 +1402,8 @@ function cmdDoctor() {
   );
   const roles = discoverRoles();
   check(roles.size > 0, `roles discovered (${[...roles.keys()].join(", ") || "none"})`);
+  console.log(`note  startup detection budget ${AGENT_START_TIMEOUT_MS} ms`
+    + ` (HS_AGENT_START_TIMEOUT_MS, or --startup-timeout per spawn)`);
 
   try {
     writeRegistry(readRegistry());
@@ -1163,6 +1411,9 @@ function cmdDoctor() {
   } catch (e) {
     check(false, `registry not writable: ${e.message}`);
   }
+
+  if (opts.spawn) probeSpawn(check);
+  else console.log("note  static checks only; add --spawn to time one real haiku launch");
 
   process.exit(failed ? 1 : 0);
 }
@@ -1195,18 +1446,29 @@ function main(argv = process.argv.slice(2)) {
       case "spawn": cmdSpawn(opts); break;
       case "list": cmdList(opts); break;
       case "result": cmdResult(positional[0] || die("result needs a name"), opts); break;
-      case "resume": cmdResume(positional[0] || die("resume needs a name")); break;
+      case "resume": cmdResume(positional[0] || die("resume needs a name"), opts); break;
+      case "adopt": cmdAdopt(positional[0] || die("adopt needs a name"), opts); break;
       case "stop": cmdStop(positional[0] || die("stop needs a name")); break;
       case "stop-all": cmdStopAll(); break;
       case "forget": cmdForget(positional[0] || die("forget needs a name")); break;
       case "roles": cmdRoles(); break;
       case "install": cmdInstall(); break;
       case "uninstall": cmdUninstall(); break;
-      case "doctor": cmdDoctor(); break;
+      case "doctor": cmdDoctor(opts); break;
       default:
-        console.error(
-          "usage: hs.mjs spawn|list|result|resume|stop|stop-all|forget|roles|install|uninstall|doctor",
-        );
+        console.error([
+          "usage: hs.mjs <command> [options]",
+          "",
+          "  spawn --role <name> [--task ...]   launch a child in its own tab (--help for options)",
+          "  list [--json] [--all]              children this session owns; --all adds live agents it does not",
+          "  result <name> [--lines N]          what a child reported",
+          "  resume <name>                      reopen a stopped child with its history",
+          "  adopt <name> [--role <name>]       re-register a live child this session launched",
+          "  stop <name> | stop-all             close the tab; the session stays resumable",
+          "  forget <name>                      drop a stopped child and free its name",
+          "  roles                              available roles",
+          "  install | uninstall | doctor [--spawn]",
+        ].join("\n"));
         process.exitCode = 2;
     }
   } catch (error) {
@@ -1216,6 +1478,7 @@ function main(argv = process.argv.slice(2)) {
 }
 
 export {
+  AGENT_START_TIMEOUT_MS,
   CALLBACK_PROMPT_PATH,
   CALLBACK_SYSTEM_PROMPT,
   discoverRoles,

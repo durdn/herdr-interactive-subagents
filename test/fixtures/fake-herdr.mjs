@@ -31,7 +31,8 @@ if (args[0] === "agent" && args[1] === "get") {
   if (process.env.HS_FAKE_GET_FAILURE === "1") {
     json({ error: { code: "server_unavailable", message: "fake get failure" } }, 1);
   }
-  const agent = (state.live || []).find((item) => item.name === args[2]);
+  const agent = (state.live || []).find((item) =>
+    item.name === args[2] || item.pane_id === args[2]);
   json(agent ? { result: { agent } } : { error: { code: "agent_not_found" } }, agent ? 0 : 1);
 }
 if (args[0] === "tab" && args[1] === "create") {
@@ -52,8 +53,30 @@ if (args[0] === "agent" && args[1] === "start") {
     json({ error: { code: "agent_not_ready", message: "fake startup failure" } }, 1);
   }
   const name = args[2];
-  const agent = { name, agent_status: "idle", tab_id: `w-test:t${state.tabs}` };
-  state.live = [...(state.live || []).filter((item) => item.name !== name), agent];
+  const sessionId = args[args.indexOf("--session-id") + 1]
+    || args[args.indexOf("--resume") + 1] || null;
+  // Herdr assigns the agent name only when a start is detected cleanly, so a
+  // child that missed detection is live and nameless - reachable by pane only.
+  const nameless = process.env.HS_FAKE_START_NAMELESS === "1";
+  const paneId = `w-test:p${state.tabs}`;
+  const agent = {
+    ...(nameless ? {} : { name }),
+    agent_status: "idle",
+    tab_id: `w-test:t${state.tabs}`,
+    pane_id: paneId,
+    cwd: process.cwd(),
+    workspace_id: process.env.HERDR_WORKSPACE_ID || "w-test",
+    agent_session: sessionId ? { value: sessionId } : undefined,
+  };
+  state.live = [
+    ...(state.live || []).filter((item) => item.name !== name && item.pane_id !== paneId),
+    agent,
+  ];
+  // The field failure: Herdr's detection wait expires on a child that is in
+  // fact running, so it is live in `agent list` and an error at `agent start`.
+  if (nameless || process.env.HS_FAKE_START_LATE === "1") {
+    json({ error: { code: "agent_not_ready", message: "fake late detection" } }, 1);
+  }
   json({ result: { agent } });
 }
 if (args[0] === "pane" && args[1] === "get") {

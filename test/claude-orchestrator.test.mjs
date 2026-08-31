@@ -264,27 +264,84 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     }
   });
 
-  it("fails closed when Herdr reports startup may have begun", () => {
+  it("keeps the tab and names the recovery when startup cannot be confirmed", () => {
     const fx = fixture();
     const result = run(fx, [
       "spawn", "--role", "scout", "--name", "broken", "--cwd", fx.project,
-    ], { env: { HS_FAKE_START_FAILURE: "1" } });
+    ], { env: { HS_FAKE_START_FAILURE: "1", HS_AGENT_START_TIMEOUT_MS: "4000" } });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /could not start 'broken'; tab w-test:t1 closed/);
-    assert.match(result.stderr, /Ownership retained for diagnosis/);
+    assert.match(result.stderr, /could not confirm 'broken' started within 4000 ms/);
+    assert.match(result.stderr, /tab w-test:t1 is still open/);
+    assert.match(result.stderr, /hs\.mjs stop broken\b/);
+    assert.match(result.stderr, /'forget broken' to free the name/);
     assert.ok(calls(fx).some((call) => call[0] === "agent" && call[1] === "read"));
-    assert.ok(calls(fx).some((call) => call[0] === "tab" && call[1] === "close"));
+    assert.equal(
+      calls(fx).some((call) => call[0] === "tab" && call[1] === "close"), false,
+      "a child that may be running must keep its tab",
+    );
     const child = registry(fx).children[0];
     assert.equal(child.name, "broken");
     assert.equal(child.startupUncertain, true);
     assert.ok(existsSync(child.ownershipClaim));
     assert.ok(existsSync(child.sessionClaim));
+    assert.equal(JSON.parse(ok(run(fx, ["list", "--json"])).stdout)[0].status, "starting");
 
     const duplicate = run(fx, [
       "spawn", "--role", "scout", "--name", "broken", "--cwd", fx.project,
     ]);
     assert.equal(duplicate.status, 1);
     assert.match(duplicate.stderr, /explicit name 'broken' is already owned/);
+
+    // The recovery the message prints has to be the one that actually works.
+    ok(run(fx, ["stop", "broken"]));
+    ok(run(fx, ["forget", "broken"]));
+    assert.equal(JSON.parse(ok(run(fx, [
+      "spawn", "--role", "scout", "--name", "broken", "--cwd", fx.project,
+    ])).stdout).name, "broken");
+  });
+
+  it("adopts a child Herdr detected late instead of closing its tab", () => {
+    const fx = fixture();
+    const result = ok(run(fx, [
+      "spawn", "--role", "scout", "--name", "slow-boot", "--cwd", fx.project,
+    ], { env: { HS_FAKE_START_LATE: "1", HS_AGENT_START_TIMEOUT_MS: "4000" } }));
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.status, "idle");
+    assert.equal(output.startupUncertain, undefined);
+    assert.equal(calls(fx).some((call) => call[0] === "tab" && call[1] === "close"), false);
+    assert.equal(registry(fx).children[0].name, "slow-boot");
+  });
+
+  it("resolves a child Herdr left nameless through the pane it created", () => {
+    const fx = fixture();
+    const result = ok(run(fx, [
+      "spawn", "--role", "scout", "--name", "nameless", "--cwd", fx.project,
+    ], { env: { HS_FAKE_START_NAMELESS: "1" } }));
+    assert.equal(JSON.parse(result.stdout).status, "idle");
+    assert.equal(calls(fx).some((call) => call[0] === "tab" && call[1] === "close"), false);
+    assert.deepEqual(
+      calls(fx).filter((call) => call[0] === "agent" && call[1] === "get").map((call) => call[2]),
+      ["nameless", "w-test:p1"],
+      "name first, then the pane Herdr still answers for",
+    );
+    assert.equal(registry(fx).children[0].startupUncertain, undefined);
+    assert.equal(JSON.parse(ok(run(fx, ["list", "--json"])).stdout)[0].status, "idle");
+  });
+
+  it("returns before detection with --no-wait and stays recoverable", () => {
+    const fx = fixture();
+    const result = ok(run(fx, [
+      "spawn", "--role", "scout", "--name", "batched", "--cwd", fx.project, "--no-wait",
+    ], { env: { HS_FAKE_START_FAILURE: "1" } }));
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.status, "starting");
+    assert.match(output.next, /booting in tab w-test:t1, not detected yet/);
+    assert.equal(calls(fx).some((call) => call[0] === "tab" && call[1] === "close"), false);
+    const start = calls(fx).find((call) => call[0] === "agent" && call[1] === "start");
+    assert.equal(start[start.indexOf("--timeout") + 1], "5000");
+    assert.equal(registry(fx).children[0].startupUncertain, true);
+    assert.equal(JSON.parse(ok(run(fx, ["list", "--json"])).stdout)[0].status, "starting");
+    ok(run(fx, ["stop", "batched"]));
   });
 
   it("rolls back claims when pane-busy proves startup never began", () => {
@@ -297,12 +354,61 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     } });
     assert.equal(failed.status, 1);
     assert.match(failed.stderr, /could not start 'retryable'/);
-    assert.equal(existsSync(registryPath(fx)), false);
+    assert.match(failed.stderr, /never reached a shell prompt/);
+    assert.ok(calls(fx).some((call) => call[0] === "tab" && call[1] === "close"));
+    assert.deepEqual(registry(fx).children, []);
 
     const retried = ok(run(fx, [
       "spawn", "--role", "scout", "--name", "retryable", "--cwd", fx.project,
     ]));
     assert.equal(JSON.parse(retried.stdout).name, "retryable");
+  });
+
+  it("adopts a live child whose registry entry a killed spawn never wrote", () => {
+    const fx = fixture();
+    const spawned = JSON.parse(ok(run(fx, [
+      "spawn", "--role", "worker", "--name", "orphan", "--cwd", fx.project,
+    ])).stdout);
+    // What a killed hs.mjs leaves behind: the name claim, a live tab, no entry.
+    writeFileSync(registryPath(fx), JSON.stringify({ children: [] }));
+
+    const blind = ok(run(fx, ["list"]));
+    assert.match(blind.stdout, /no subagents owned by this session/);
+    assert.match(blind.stdout, /also live in w-env, not owned by this session: orphan \(w-test:t1\)/);
+
+    const adopted = JSON.parse(ok(run(fx, ["adopt", "orphan", "--role", "worker"])).stdout);
+    assert.equal(adopted.sessionId, spawned.sessionId);
+    assert.equal(adopted.tabId, "w-test:t1");
+    assert.equal(adopted.status, "idle");
+    assert.match(adopted.next, /cannot be resumed/);
+    assert.equal(JSON.parse(ok(run(fx, ["list", "--json"])).stdout)[0].name, "orphan");
+    ok(run(fx, ["stop", "orphan"]));
+  });
+
+  it("refuses to adopt an agent this session never claimed, and prints spawn usage", () => {
+    const fx = fixture();
+    const foreign = run(fx, ["adopt", "someone-else"]);
+    assert.equal(foreign.status, 1);
+    assert.match(foreign.stderr, /not a live Herdr agent/);
+
+    const before = calls(fx).length;
+    const usage = ok(run(fx, ["spawn", "--help"]));
+    for (const flag of ["--role", "--task-file", "--add-dir", "--startup-timeout", "--no-wait"]) {
+      assert.ok(usage.stdout.includes(flag), `spawn --help must document ${flag}`);
+    }
+    assert.equal(calls(fx).length, before, "--help must not touch Herdr");
+
+    const missingRole = run(fx, ["spawn", "--cwd", fx.project]);
+    assert.equal(missingRole.status, 1);
+    assert.match(missingRole.stderr, /spawn needs --role <name>/);
+    assert.match(missingRole.stderr, /--startup-timeout <ms>/);
+
+    const badTimeout = run(fx, [
+      "spawn", "--role", "scout", "--cwd", fx.project, "--startup-timeout", "10",
+    ]);
+    assert.equal(badTimeout.status, 1);
+    assert.match(badTimeout.stderr, /--startup-timeout must be more than 3000 and at most 300000 ms/);
+    assert.equal(calls(fx).some((call) => call[0] === "tab" && call[1] === "create"), false);
   });
 
   it("atomically rejects concurrent explicit-name spawns before duplicate Herdr mutation", async () => {

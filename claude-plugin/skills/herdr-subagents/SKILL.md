@@ -33,14 +33,20 @@ resolves somewhere else entirely.
 own preconditions, and every failure it can hit prints what to do about it. `doctor` is for after
 something breaks, not before.
 
-**Fan out by putting every spawn in ONE Bash call**, one line each, each with its own `--name`:
+**Fan out by putting every spawn in ONE Bash call**, one line each, with its own `--name` and
+`--no-wait`:
 
 ```bash
 HS=~/.claude/herdr-subagents/hs.mjs
-node $HS spawn --role scout      --name auth-scout --cwd "$PWD" --task "Map how login works: ..."
-node $HS spawn --role researcher --name rfc-reader --cwd "$PWD" --task "Read RFC 6749 and ..."
-node $HS spawn --role worker     --name flake-fix  --cwd "$PWD" --task "test_x is flaky: ..."
+node $HS spawn --role scout      --name auth-scout --no-wait --cwd "$PWD" --task "Map how login works: ..."
+node $HS spawn --role researcher --name rfc-reader --no-wait --cwd "$PWD" --task "Read RFC 6749 and ..."
+node $HS spawn --role worker     --name flake-fix  --no-wait --cwd "$PWD" --task "test_x is flaky: ..."
 ```
+
+`--no-wait` returns as soon as each child is launched rather than waiting for Herdr to detect it,
+so a batch of five costs seconds. Without it each spawn waits out its own detection window and the
+batch can outlive the Bash tool's timeout — a killed batch is how half-started children happen. One
+spawn on its own does not need it.
 
 Three to five is the useful range. Each is a separate session with its own token cost, and past
 that the coordination costs more than the parallelism buys. Give each a task that does not touch
@@ -75,6 +81,10 @@ effort, so recon is not billed like review. A child inherits neither the model n
 this session; `--model` and `--effort` at spawn override the role. Raise effort for a genuinely
 hard task, not by reflex — and note that Haiku ignores effort entirely.
 
+`scout` and `researcher` have no shell, and one cannot be granted read-only: a scoped
+`Bash(git status:*)` entry in a role's `tools:` grants plain unrestricted `Bash`. Recon that has to
+run a command is a `worker` whose task says to change nothing.
+
 A project can add roles in `.claude/agents/` and a user in `~/.claude/agents/`; both shadow the
 bundled ones by name. A custom role's tool policy must allow `SendMessage`: an explicit `tools:`
 list must include it and `disallowedTools:` must not deny it, or `spawn` rejects the role before
@@ -89,6 +99,33 @@ then you never need a lookup step first.
 trust dialog. `spawn` checks this and refuses rather than stranding a tab. The safe default is the
 directory you are working in now; reach anywhere else with `--add-dir <path>`, once per directory.
 A child that hits a path outside both shows up as `blocked`, waiting on a permission prompt.
+
+## When a spawn does not come back clean
+
+`could not confirm '<handle>' started` means Herdr's *detection* timed out, not that the child is
+dead — under load it usually is running fine, and its Claude session still answers to the handle
+over `SendMessage` either way. What it lacks is a Herdr agent *name*, which Herdr assigns only on a
+clean start, so Herdr's own commands need the pane id the error prints. The tab is left open and the
+child is registered as `starting`, so look before you clean up:
+
+```bash
+node ~/.claude/herdr-subagents/hs.mjs list      # resolves through the pane; 'starting' = still not up
+herdr agent read <pane id from the error> --source detection --lines 40
+```
+
+If it is alive, carry on: it reads its brief and reports back on its own. If it is dead, this is the
+recovery, and it is also what frees the name for a retry:
+
+```bash
+node ~/.claude/herdr-subagents/hs.mjs stop <handle>
+node ~/.claude/herdr-subagents/hs.mjs forget <handle>
+```
+
+`--startup-timeout <ms>` raises the detection budget (default 90000) on a consistently slow machine.
+
+`list` also names live agents in this workspace that this session does not own. If one is a child
+of yours whose spawn was killed before it could be recorded, `adopt <handle>` puts it back under
+`list`, `result` and `stop`.
 
 ## Steering, questions, and blocked children
 
@@ -180,3 +217,7 @@ node ~/.claude/herdr-subagents/hs.mjs doctor
 Checks that you are inside Herdr, that this Claude Code can send and receive cross-session
 messages, that children have an address to answer on, and that the roles parse. Run it when a
 spawn fails or a child never reports — not as a warm-up.
+
+Those are static checks and they stay green while spawning is broken. `doctor --spawn` adds the one
+that is not: it launches a real throwaway haiku child, reports how long detection actually took, and
+closes it again. Reach for that when spawns are timing out.

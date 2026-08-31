@@ -171,6 +171,44 @@ and `bypassPermissions` are rejected before a Herdr tab is created.
   forwarding shim at the fixed path `~/.claude/herdr-subagents/hs.mjs`, which SKILL.md names
   verbatim: stable, machine-independent, and correct under `~` expansion in both shells. `spawn`
   rewrites it when stale, so a moved checkout self-heals without an install.
+- **Herdr's `agent start --timeout` bounds detection, not startup, and the two diverge under
+  load.** Field sessions on 2026-08-31 lost four spawns in five to it: `agent start` reported the
+  child had not come up while `herdr agent list` showed it live and working, one of them for a
+  70-minute task. The hardcoded 60 s made it common; closing the tab on that verdict made it fatal.
+  Three rules now hold. Only `agent_pane_busy` — nothing was typed into the pane — is treated as
+  proof that startup never began, and only that closes a tab. Every other outcome asks
+  `herdr agent get` before believing the timeout, and keeps the tab either way. And the budget is
+  `HS_AGENT_START_TIMEOUT_MS` / `--startup-timeout`, defaulting to 90 s of Herdr's 300 s maximum.
+- **A child that misses detection has no Herdr name, only a pane.** Herdr assigns the agent name
+  as part of a successful `agent start`, so after a detection timeout the child is live and `idle`
+  in `herdr agent list` while `agent get <name>`, `agent read <name>` and every other name-addressed
+  command answer `agent_not_found`. Its `pane_id` — which `tab create` already handed us — is the
+  handle that still resolves, and `agent get <pane_id>` returns the full record including the
+  session id we pinned. So `confirmAgentPresent` falls back to the pane, `list` indexes live agents
+  by pane as well as by name, and the failure message points at the pane rather than the name. None
+  of this touches `SendMessage`: Claude Code's own name registry comes from `--name`, so an
+  undetected child is still addressable and still reports back.
+- **The registry entry has to be written before the wait, not after it.** A spawn batch that
+  outlives the caller's shell timeout is killed mid-detection, and the child it already launched
+  used to survive with no registry entry at all: `list`, `result` and `stop` each denied it
+  existed, and `herdr tab close` was the only way to end it. `spawn` now records the child as
+  `startupUncertain` as soon as it has a pane, and replaces that with the full entry on success;
+  `rollbackUnstarted` removes it again on the one provably-unstarted path. `adopt` covers the
+  remainder — a live agent whose name claim this session holds but whose entry never landed. It
+  keys on the claim, never the tab, so it cannot seize another session's child.
+- **`--no-wait` is what makes the documented fan-out honest.** The skill asks for every spawn in
+  one Bash call; at one detection window each that batch ran 3-5 minutes and was killed by the tool
+  timeout. `--no-wait` returns once the child is launched, so three real spawns now cost 16 s
+  measured end to end instead of minutes.
+- **A shell cannot be granted read-only through a role.** The obvious fix for a `scout` that needs
+  one `python -c` is a scoped `tools:` entry. Verified against claude 2.1.251: an agent declared
+  with `Bash(node --version:*)` reports plain `Bash` in its tool list and runs `echo` happily
+  under `--permission-mode auto`. The specifier is decoration. `scout` therefore keeps no shell,
+  and recon needing a command is a `worker` told to change nothing.
+- **Static health checks stay green through a broken spawn.** `doctor` passed every gate in both
+  field sessions while four spawns in five failed, because nothing in it exercised a launch.
+  `doctor --spawn` launches a throwaway haiku scout, reports the detection latency it measured,
+  and stops it. On an idle box that is 5.3 s against the 90 s budget.
 - **The transcript's last assistant text is not the result.** A child that reports correctly does
   so with a `SendMessage` tool call and often prints something afterwards. `hs.mjs result` returns
   the last `SendMessage` argument when there is one, and falls back to the last text.

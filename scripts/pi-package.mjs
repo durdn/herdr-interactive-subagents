@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runHarness } from "./harness-install.mjs";
 
 const command = process.argv[2] ?? "doctor";
 const pluginRoot = resolve(
@@ -26,12 +27,9 @@ function run(bin, args, options = {}) {
 }
 
 if (command === "install") {
-  console.log(`Installing pi package from ${pluginRoot}`);
-  run("pi", ["install", pluginRoot]);
-  console.log("Installed. Restart pi (or run /reload) inside Herdr before spawning subagents.");
+  runHarness("install", "pi", { root: pluginRoot });
 } else if (command === "remove") {
-  console.log(`Removing pi package ${pluginRoot}`);
-  run("pi", ["remove", pluginRoot]);
+  runHarness("uninstall", "pi", { root: pluginRoot });
 } else if (command === "doctor") {
   let failed = false;
   const check = (ok, message) => {

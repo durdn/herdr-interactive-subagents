@@ -8,12 +8,12 @@ platforms = ["linux", "macos", "windows"]
 [[actions]]
 id = "install-pi"
 title = "Install the companion pi package"
-command = ["node", "scripts/pi-package.mjs", "install"]
+command = ["node", "scripts/harness-install.mjs", "install", "pi"]
 
 [[actions]]
 id = "remove-pi"
 title = "Remove the companion pi package"
-command = ["node", "scripts/pi-package.mjs", "remove"]
+command = ["node", "scripts/harness-install.mjs", "uninstall", "pi"]
 
 [[actions]]
 id = "doctor"
@@ -23,14 +23,29 @@ command = ["node", "scripts/pi-package.mjs", "doctor"]
 [[actions]]
 id = "install-claude"
 title = "Install the Claude Code orchestrator plugin"
-command = ["node", "claude-plugin/scripts/hs.mjs", "install"]
+command = ["node", "scripts/harness-install.mjs", "install", "claude"]
 
 [[actions]]
 id = "remove-claude"
 title = "Remove the Claude Code orchestrator plugin"
-command = ["node", "claude-plugin/scripts/hs.mjs", "uninstall"]
+command = ["node", "scripts/harness-install.mjs", "uninstall", "claude"]
 
 [[actions]]
 id = "doctor-claude"
 title = "Check the Claude Code orchestrator setup"
-command = ["node", "claude-plugin/scripts/hs.mjs", "doctor"]
+command = ["node", "scripts/harness-install.mjs", "doctor", "claude"]
+
+[[actions]]
+id = "install-codex"
+title = "Install the Codex orchestrator skill"
+command = ["node", "scripts/harness-install.mjs", "install", "codex"]
+
+[[actions]]
+id = "remove-codex"
+title = "Remove the Codex orchestrator skill"
+command = ["node", "scripts/harness-install.mjs", "uninstall", "codex"]
+
+[[actions]]
+id = "doctor-codex"
+title = "Check the Codex orchestrator skill"
+command = ["node", "scripts/harness-install.mjs", "doctor", "codex"]

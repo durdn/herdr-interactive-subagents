@@ -29,10 +29,13 @@
     "skills/"
   ],
   "scripts": {
+    "harness:install": "node scripts/harness-install.mjs install",
+    "harness:uninstall": "node scripts/harness-install.mjs uninstall",
+    "harness:doctor": "node scripts/harness-install.mjs doctor",
     "roles:generate": "node scripts/roles.mjs generate",
     "roles:check": "node scripts/roles.mjs check",
     "typecheck": "tsc --project tsconfig.json",
-    "test": "npm run roles:check && node --test test/roles.test.mjs test/test.ts test/web-tools.test.ts test/claude-orchestrator.test.mjs test/codex-plugin.test.mjs",
+    "test": "npm run roles:check && node --test test/roles.test.mjs test/test.ts test/web-tools.test.ts test/claude-orchestrator.test.mjs test/codex-plugin.test.mjs test/harness-install.test.mjs",
     "test:surface": "node --test --test-concurrency=1 test/integration/herdr-surface.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
     "prepack": "npm run roles:check"

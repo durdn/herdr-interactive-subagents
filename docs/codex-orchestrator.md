@@ -1,5 +1,21 @@
 # Codex as the orchestrator
 
+## Install from a checkout
+
+Use the repository's cross-harness installer rather than creating a link by hand:
+
+```bash
+npm run harness:install -- codex
+npm run harness:doctor -- codex
+```
+
+The installer idempotently links this checkout's `skills/herdr-subagents` directory into the
+user-wide `~/.agents/skills/herdr-subagents` location and protects any foreign file already at that
+path. It does not create, configure, or publish a marketplace. Start a new Codex session after
+installing; the capability appears as the `herdr-subagents` skill, not as a marketplace plugin.
+
+The same command accepts `pi`, `claude`, or `all`; use `harness:uninstall` for the inverse operation.
+
 The Codex adapter ports the orchestration contract, not the external-process implementation used
 by Pi and Claude Code. Current Codex releases already provide native subagent threads, so the
 adapter is a skills-only Codex plugin.

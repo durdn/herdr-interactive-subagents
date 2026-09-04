@@ -41,6 +41,23 @@ Nested tmux is neither required nor supported. Herdr must see the actual agent p
 
 ## Install
 
+### One installer for every harness
+
+From a checkout, use the same repeatable command shape for Pi, Claude Code, and Codex:
+
+```bash
+npm run harness:install -- pi
+npm run harness:install -- claude
+npm run harness:install -- codex
+npm run harness:install -- all
+```
+
+The matching `harness:doctor` and `harness:uninstall` commands accept the same target. Local
+development installs are idempotent and source-linked: Pi records the checkout as a package,
+Claude Code deploys its owned skill/commands and a forwarding shim, and Codex links the standalone
+skill into the user-wide `~/.agents/skills/` directory. The installer refuses to overwrite or
+remove foreign files. It never creates, configures, or publishes a Codex marketplace.
+
 ### As a Herdr plugin
 
 ```bash
@@ -267,9 +284,17 @@ python <plugin-creator>/scripts/validate_plugin.py .
 python <skill-creator>/scripts/quick_validate.py skills/herdr-subagents
 ```
 
-Install the packaged plugin through a Codex plugin marketplace, then start a new Codex thread so
-the skill catalog is refreshed. The plugin requires current Codex releases with the stable
-multi-agent feature enabled (it is enabled by default).
+For a repeatable local installation that does not use a marketplace:
+
+```bash
+npm run harness:install -- codex
+npm run harness:doctor -- codex
+```
+
+This links `skills/herdr-subagents` into the user-wide `~/.agents/skills/herdr-subagents` location.
+Start a new Codex session afterwards so the skill catalog is refreshed. It appears as the global
+`herdr-subagents` skill; no marketplace plugin is installed. The skill requires current Codex
+releases with the stable multi-agent feature enabled (it is enabled by default).
 
 ## Development lineage
 

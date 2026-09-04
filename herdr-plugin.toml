@@ -1,6 +1,6 @@
 id = "durdn.interactive-subagents"
 name = "Interactive Subagents"
-version = "4.0.2"
+version = "4.0.3"
 min_herdr_version = "0.8.0"
 description = "Role-based subagent workflows for pi, Claude Code, and Codex in Herdr"
 platforms = ["linux", "macos", "windows"]

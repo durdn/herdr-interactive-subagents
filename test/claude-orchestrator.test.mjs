@@ -695,11 +695,12 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     assert.ok(names.includes("skills/herdr-subagents/agents/openai.yaml"));
     assert.deepEqual(
       names.filter((name) => name.startsWith("agents/") && name.endsWith(".md")).sort(),
-      ["agents/researcher.md", "agents/scout.md", "agents/worker.md"],
+      ["agents/general.md", "agents/researcher.md", "agents/scout.md", "agents/worker.md"],
     );
     assert.deepEqual(
       names.filter((name) => name.startsWith("claude-plugin/agents/") && name.endsWith(".md")).sort(),
       [
+        "claude-plugin/agents/general.md",
         "claude-plugin/agents/researcher.md",
         "claude-plugin/agents/reviewer.md",
         "claude-plugin/agents/scout.md",
@@ -709,6 +710,7 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     assert.deepEqual(
       names.filter((name) => name.startsWith("skills/herdr-subagents/references/") && name.endsWith(".md")).sort(),
       [
+        "skills/herdr-subagents/references/general.md",
         "skills/herdr-subagents/references/researcher.md",
         "skills/herdr-subagents/references/reviewer.md",
         "skills/herdr-subagents/references/scout.md",

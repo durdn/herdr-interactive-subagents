@@ -24,19 +24,24 @@ describe("canonical bundled role catalog", () => {
   it("has the exact adapter inventories", () => {
     assert.deepEqual(
       catalog.roles.filter((entry) => entry.adapters.pi).map((entry) => entry.name),
-      ["scout", "researcher", "worker"],
+      ["general", "scout", "researcher", "worker"],
     );
     assert.deepEqual(
       catalog.roles.filter((entry) => entry.adapters.claude).map((entry) => entry.name),
-      ["scout", "researcher", "worker", "reviewer"],
+      ["general", "scout", "researcher", "worker", "reviewer"],
     );
     assert.deepEqual(
       catalog.roles.filter((entry) => entry.adapters.codex).map((entry) => entry.name),
-      ["scout", "researcher", "worker", "reviewer"],
+      ["general", "scout", "researcher", "worker", "reviewer"],
     );
   });
 
   it("keeps Pi sandbox and autonomy semantics explicit", () => {
+    const general = role("general", "pi");
+    assert.equal(general.fields.tools, "read");
+    assert.equal(general.fields.thinking, "low");
+    assert.equal(general.fields["auto-exit"], "true");
+
     const scout = role("scout", "pi");
     assert.deepEqual(scout.fields, {
       name: "scout",
@@ -61,7 +66,7 @@ describe("canonical bundled role catalog", () => {
   });
 
   it("keeps Claude callback, model, effort, and reviewer semantics explicit", () => {
-    for (const name of ["scout", "researcher", "worker", "reviewer"]) {
+    for (const name of ["general", "scout", "researcher", "worker", "reviewer"]) {
       const definition = role(name, "claude");
       assert.match(definition.fields.tools, /(?:^|, )SendMessage(?:,|$)/);
       assert.doesNotMatch(definition.prompt, /SendMessage|cross-session-message|Reply address/);
@@ -74,6 +79,7 @@ describe("canonical bundled role catalog", () => {
         return [entry.name, definition.fields.model, definition.fields.effort];
       }),
       [
+        ["general", "haiku", "low"],
         ["scout", "sonnet", "low"],
         ["researcher", "sonnet", "medium"],
         ["worker", "sonnet", "high"],
@@ -84,7 +90,7 @@ describe("canonical bundled role catalog", () => {
   });
 
   it("keeps Codex role defaults and visible-session follow-up coordination explicit", () => {
-    for (const name of ["scout", "researcher", "worker", "reviewer"]) {
+    for (const name of ["general", "scout", "researcher", "worker", "reviewer"]) {
       const definition = role(name, "codex");
       assert.equal(definition.fields.name, name);
       assert.match(definition.prompt, /no knowledge of the parent conversation/);
@@ -98,6 +104,7 @@ describe("canonical bundled role catalog", () => {
         return [entry.name, definition.fields.model, definition.fields.reasoning, definition.fields.access];
       }),
       [
+        ["general", "gpt-5.6-luna", "low", "read-only"],
         ["scout", "gpt-5.6-terra", "low", "read-only"],
         ["researcher", "gpt-5.6-terra", "medium", "read-only"],
         ["worker", "gpt-5.6-sol", "high", "inherited writable"],

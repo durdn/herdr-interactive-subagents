@@ -1,6 +1,6 @@
 {
   "name": "herdr-interactive-subagents",
-  "version": "4.0.2",
+  "version": "4.0.3",
   "description": "Role-based Codex subagent orchestration for sessions running in Herdr",
   "author": {
     "name": "Amos Blomqvist",
@@ -14,7 +14,7 @@
   "interface": {
     "displayName": "Herdr Interactive Subagents",
     "shortDescription": "Run focused Codex agents in visible Herdr tabs",
-    "longDescription": "Delegate reconnaissance, research, implementation, and review to visible Codex sessions with Herdr-backed lifecycle, callbacks, transcript retrieval, and parent permission propagation.",
+    "longDescription": "Delegate general tasks, reconnaissance, research, implementation, and review to visible Codex sessions with Herdr-backed lifecycle, notifications, transcript retrieval, and parent permission propagation.",
     "developerName": "Amos Blomqvist",
     "category": "Developer Tools",
     "capabilities": ["Interactive"],

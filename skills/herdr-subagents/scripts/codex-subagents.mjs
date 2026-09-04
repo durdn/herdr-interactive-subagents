@@ -125,10 +125,6 @@ function callerWorkspace() {
   return currentPane()?.workspace_id || process.env.HERDR_WORKSPACE_ID;
 }
 
-function parentPaneId() {
-  return process.env.HERDR_PANE_ID || currentPane()?.pane_id || null;
-}
-
 function parentSessionId() {
   const raw = process.env.CODEX_SESSION_ID
     || process.env.CODEX_THREAD_ID
@@ -468,9 +464,9 @@ function createChildTab(name, cwd, workspace) {
   return { tabId, paneId, codexExecutable: environment.executable };
 }
 
-function startWatcher(name, parentPane) {
-  if (!parentPane || process.env.HCS_DISABLE_WATCHER === "1") return false;
-  const child = spawn(process.execPath, [SCRIPT_PATH, "_watch", name, "--parent-pane", parentPane], {
+function startWatcher(name) {
+  if (process.env.HCS_DISABLE_WATCHER === "1") return false;
+  const child = spawn(process.execPath, [SCRIPT_PATH, "_watch", name], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -490,7 +486,6 @@ function launchChild({ name, role, cwd, opts, resumeSessionId = null, prior = nu
   ensureNameFree(name);
   if (!existsSync(cwd) || !lstatSync(cwd).isDirectory()) die(`--cwd is not a directory: ${cwd}`);
   const workspace = callerWorkspace();
-  const parentPane = parentPaneId();
   const launch = codexLaunchArgs({ cwd, role, opts, resumeSessionId });
   const created = createChildTab(name, cwd, workspace);
   let entry = {
@@ -499,7 +494,6 @@ function launchChild({ name, role, cwd, opts, resumeSessionId = null, prior = nu
     role: role.name,
     cwd,
     workspace,
-    parentPane,
     tabId: created.tabId,
     paneId: created.paneId,
     model: launch.model,
@@ -567,7 +561,7 @@ function submitTask(entry, role, task, { wait = false, timeout } = {}) {
     briefPaths: entry.briefPaths,
   };
   upsertChild(updated);
-  startWatcher(updated.name, updated.parentPane);
+  startWatcher(updated.name);
   return updated;
 }
 
@@ -581,7 +575,7 @@ function cmdSpawn(opts) {
   const entry = submitTask(launched.entry, role, task);
   console.log(JSON.stringify({
     ...entry,
-    next: `visible child launched; wait for its Herdr callback or run result ${name} --wait`,
+    next: `visible child launched; run result ${name} --wait to collect its answer`,
   }, null, 2));
 }
 
@@ -800,26 +794,19 @@ function cmdResume(name, opts) {
   console.log(JSON.stringify({ ...entry, next: task ? "follow-up delivered" : "resumed and idle" }, null, 2));
 }
 
-function cmdWatch(name, opts) {
-  const parentPane = opts.parentPane === true ? null : opts.parentPane;
-  if (!parentPane || !NAME_RE.test(name || "")) process.exit(0);
+function cmdWatch(name) {
+  if (!NAME_RE.test(name || "")) process.exit(0);
   const waited = herdrJson([
     "agent", "wait", name, "--until", "done", "--until", "blocked", "--until", "unknown",
   ], { allowFailure: true });
   const status = waited?.result?.agent?.agent_status;
   if (!status || status === "unknown") process.exit(0);
-  const notice = [
-    `<herdr-subagent-event name="${name}" status="${status}">`,
-    `Run the herdr-subagents result command for '${name}'.`,
-    "</herdr-subagent-event>",
-  ].join("\n");
-  // As with child task delivery, --wait makes Herdr confirm that the pasted
-  // text was actually submitted. Without it, Codex can leave the callback in
-  // the parent composer until a human presses Enter.
+  const blocked = status === "blocked";
   herdrJson([
-    "agent", "prompt", parentPane, notice,
-    "--wait", "--until", "working", "--until", "done", "--until", "blocked",
-    "--timeout", String(PROMPT_START_TIMEOUT_MS),
+    "notification", "show", blocked ? "Herdr agent needs attention" : "Herdr agent finished",
+    "--body", `${name} is ${status}. ${blocked ? "Open its tab to review the prompt." : "The leader can collect its result."}`,
+    "--position", "bottom-right",
+    "--sound", blocked ? "request" : "done",
   ], { allowFailure: true });
 }
 
@@ -879,7 +866,7 @@ function main(argv = process.argv.slice(2)) {
       case "resume": cmdResume(positional[0] || die("resume needs a name"), opts); break;
       case "forget": cmdForget(positional[0] || die("forget needs a name")); break;
       case "doctor": cmdDoctor(); break;
-      case "_watch": cmdWatch(positional[0], opts); break;
+      case "_watch": cmdWatch(positional[0]); break;
       default:
         usage();
         process.exitCode = 2;

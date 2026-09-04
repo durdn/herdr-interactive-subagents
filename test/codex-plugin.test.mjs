@@ -72,10 +72,10 @@ describe("Codex plugin", () => {
     assert.match(skill, /codex-subagents\.mjs spawn/);
     assert.match(skill, /CODEX_PERMISSION_PROFILE/);
     assert.match(skill, /--dangerously-bypass-approvals-and-sandbox/);
-    assert.match(skill, /<herdr-subagent-event>/);
+    assert.match(skill, /Herdr notification/);
     assert.equal(existsSync(SCRIPT), true);
 
-    for (const name of ["scout", "researcher", "worker", "reviewer"]) {
+    for (const name of ["general", "scout", "researcher", "worker", "reviewer"]) {
       const rolePath = join(ROOT, "skills", "herdr-subagents", "references", `${name}.md`);
       assert.equal(existsSync(rolePath), true, `missing Codex role reference ${name}`);
       const role = readFileSync(rolePath, "utf8");
@@ -102,6 +102,24 @@ describe("Codex plugin", () => {
       codexPermissionArgs("team-profile").args,
       ["-c", 'default_permissions="team-profile"'],
     );
+  });
+
+  it("uses the lightweight Codex default for general work", () => {
+    const fx = fixture();
+    try {
+      const spawned = fx.run([
+        "spawn", "--role", "general", "--name", "acronym-helper",
+        "--cwd", fx.project, "--task", "Produce three acronyms.",
+      ]);
+      assert.equal(spawned.status, 0, spawned.stderr);
+      const start = fx.calls().find((call) => call[0] === "agent" && call[1] === "start");
+      const childArgs = start.slice(start.indexOf("--") + 1);
+      assert.ok(childArgs.includes("gpt-5.6-luna"));
+      assert.ok(childArgs.includes('model_reasoning_effort="low"'));
+      assert.equal(JSON.parse(spawned.stdout).role, "general");
+    } finally {
+      fx.cleanup();
+    }
   });
 
   it("parses repeated command options without executing on import", () => {
@@ -190,23 +208,23 @@ describe("Codex plugin", () => {
     }
   });
 
-  it("submits completion callbacks to the parent with an observed-state handshake", () => {
+  it("shows completion through Herdr without injecting a prompt into the parent", () => {
     const fx = fixture();
     try {
       assert.equal(fx.run([
-        "spawn", "--role", "scout", "--name", "callback-scout",
+        "spawn", "--role", "scout", "--name", "notification-scout",
         "--cwd", fx.project, "--task", "Inspect only.",
       ]).status, 0);
-      const watched = fx.run(["_watch", "callback-scout", "--parent-pane", "w-test:p0"]);
+      const watched = fx.run(["_watch", "notification-scout"]);
       assert.equal(watched.status, 0, watched.stderr);
-      const callback = fx.calls().filter((call) =>
-        call[0] === "agent" && call[1] === "prompt" && call[2] === "w-test:p0").at(-1);
-      assert.ok(callback);
-      assert.match(callback[3], /<herdr-subagent-event name="callback-scout" status="done">/);
-      assert.ok(callback.includes("--wait"));
-      assert.ok(callback.includes("working"));
-      assert.ok(callback.includes("done"));
-      assert.ok(callback.includes("blocked"));
+      const notification = fx.calls().filter((call) =>
+        call[0] === "notification" && call[1] === "show").at(-1);
+      assert.ok(notification);
+      assert.equal(notification[2], "Herdr agent finished");
+      assert.match(notification[notification.indexOf("--body") + 1], /notification-scout is done/);
+      assert.equal(notification[notification.indexOf("--sound") + 1], "done");
+      assert.equal(fx.calls().some((call) =>
+        call[0] === "agent" && call[1] === "prompt" && call[2] === "w-test:p0"), false);
     } finally {
       fx.cleanup();
     }

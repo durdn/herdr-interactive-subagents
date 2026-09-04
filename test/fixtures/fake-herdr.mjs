@@ -111,6 +111,9 @@ if (args[0] === "agent" && args[1] === "wait") {
   if (!agent) json({ error: { code: "agent_not_found" } }, 1);
   json({ result: { agent, type: "agent_waited" } });
 }
+if (args[0] === "notification" && args[1] === "show") {
+  json({ result: { type: "notification_shown", title: args[2] } });
+}
 if (args[0] === "tab" && args[1] === "close") {
   if (process.env.HS_FAKE_CLOSE_FAILURE === "1") {
     json({ error: { code: "tab_close_failed", message: "fake close failure" } }, 1);

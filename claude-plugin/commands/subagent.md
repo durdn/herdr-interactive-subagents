@@ -6,7 +6,7 @@ allowed-tools: Bash, SendMessage, Read
 
 Delegate `$ARGUMENTS` to a subagent running in its own background Herdr tab.
 
-The first word is the role (`scout`, `researcher`, `worker`, `reviewer`, or any role defined in
+The first word is the role (`general`, `scout`, `researcher`, `worker`, `reviewer`, or any role defined in
 `.claude/agents/`). The rest is the task. If no role is given, pick the one that fits and say
 which you chose.
 

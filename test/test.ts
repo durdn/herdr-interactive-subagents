@@ -1260,8 +1260,8 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
+  it("bundled general/scout/researcher/worker roles resolve as non-interactive (auto-exit)", () => {
+    for (const name of ["general", "scout", "researcher", "worker"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(

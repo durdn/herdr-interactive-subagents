@@ -39,7 +39,7 @@ transport instead of presenting the two topologies as equivalent.
 | --- | --- | --- | --- |
 | Async spawn | Extension tool plus watcher | Herdr tab plus `SendMessage` | Herdr tab plus prompt and watcher |
 | Child identity | Registry handle | Claude session name and ownership registry | Codex session id and parent ownership registry |
-| Result delivery | Pi steer | Cross-session message | Static Herdr callback plus transcript retrieval |
+| Result delivery | Pi steer | Cross-session message | Herdr notification plus explicit transcript retrieval |
 | Live steering | `subagent_message` | `SendMessage` | `herdr agent prompt` |
 | Follow-up | Resume stored Pi session | Resume Claude session | Resume retained Codex session |
 | Status | Pi widget plus Herdr | Registry plus Herdr | Registry plus live Herdr agent state |
@@ -55,14 +55,14 @@ it neither dirties the repository nor lets one leader close another leader's tab
 
 After submitting the initial prompt, the launcher starts a detached watcher. The watcher waits on
 Herdr's semantic `done`, `blocked`, or `unknown` state instead of polling. A completed or blocked
-child sends a static `<herdr-subagent-event>` prompt to the parent pane. The callback contains no
-child-authored text: it tells the leader to retrieve the result with the owned launcher command.
-That keeps untrusted task output out of the control channel.
+child produces a native Herdr notification containing only its name and status. It never inserts
+markup or a synthetic user prompt into the leader's transcript. The leader collects trusted output
+with `result <name> --wait`; Herdr's toast is user-facing status, not a hidden Codex mailbox.
 
 The full role and task are written to a parent-scoped temporary brief. Herdr submits only a short
 instruction pointing Codex at that file, then requires a state-observed submission handshake.
-Parent callbacks use the same handshake. This avoids the Codex bracketed-paste threshold, where a
-long fire-and-forget prompt can remain in the composer without consuming Enter.
+This avoids the Codex bracketed-paste threshold, where a long fire-and-forget prompt can remain in
+the composer without consuming Enter.
 
 `result` finds the Codex session id reported by Herdr and reads the last assistant message from the
 Codex JSONL transcript. The CLI is launched with `--no-alt-screen`, so retained Herdr scrollback is

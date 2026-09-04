@@ -1,4 +1,8 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
@@ -46,6 +50,7 @@ import {
   writeSubagentLoadout,
   type OwnershipClaim,
   type SessionStats,
+  SUBAGENT_LOADOUT_VERSION,
   type SubagentLoadout,
 } from "./session.ts";
 import {
@@ -69,10 +74,11 @@ import {
 } from "./activity.ts";
 import {
   SUBAGENT_ALLOWLIST,
-  discoverAgentDefinitions,
+  discoverModelInvocableAgentDefinitions,
   getAgentConfigDir,
   getDefaultSessionDirFor,
   loadAgentDefaults,
+  type AgentDefaults,
   resolveEffectiveInteractive,
   resolveEffectiveModel,
   resolveLaunchBehavior,
@@ -140,6 +146,9 @@ const SubagentParams = Type.Object({
     }),
   ),
 });
+
+type SubagentToolParams = Static<typeof SubagentParams>;
+type LaunchSubagentParams = Omit<SubagentToolParams, "name"> & { name: string };
 
 /**
  * The full subagent lifecycle/spawning toolset registered by this extension.
@@ -1051,23 +1060,28 @@ function closeLaunchSurface(surface: string | undefined): boolean {
  * Call watchSubagent() on the returned object to observe completion.
  */
 async function launchSubagent(
-  params: typeof SubagentParams.static,
+  params: LaunchSubagentParams,
   ctx: {
-    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    sessionManager: { getSessionFile(): string | undefined; getSessionId(): string; getSessionDir(): string };
     cwd: string;
     model?: { provider?: string; id?: string } | null;
   },
-  options: { parentArtifactDir: string; surface?: string },
+  options: { parentArtifactDir: string; agentDefs: AgentDefaults; surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
   const completionSentinel = createCompletionSentinel();
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  // The caller supplies the exact definition selected by the authoritative
+  // model-invocation resolver. Never re-load by filename or fall back to null.
+  const agentDefs = options.agentDefs;
+  if (!agentDefs) {
+    throw new LaunchFailure(`Refusing to launch agent "${params.agent}" without its resolved profile`, "none");
+  }
   const effectiveModel = resolveEffectiveModel(params, agentDefs, ctx.model);
-  const effectiveTools = agentDefs?.tools;
-  const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveTools = agentDefs.tools;
+  const effectiveSkills = agentDefs.skills;
+  const effectiveThinking = agentDefs.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1109,24 +1123,24 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
+  const modeHint = agentDefs.autoExit
     ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
     : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = agentDefs.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
   // An agent with a non-empty subagent_agents list is granted the spawning
   // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
-  const identity = agentDefs?.body ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
+  const grantSpawning = !!(agentDefs.subagentAgents && agentDefs.subagentAgents.length > 0);
+  const identity = agentDefs.body ?? null;
+  const systemPromptMode = agentDefs.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
+  if (agentDefs.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${randomBytes(12).toString("hex")}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
@@ -1255,14 +1269,15 @@ async function launchSubagent(
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
   const loadout: SubagentLoadout = {
+    version: SUBAGENT_LOADOUT_VERSION,
     agent: params.agent ?? null,
     toolAllowlist,
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
-    spawnable: agentDefs?.subagentAgents ?? null,
-    autoExit: agentDefs?.autoExit ?? false,
+    spawnable: agentDefs.subagentAgents ?? null,
+    autoExit: agentDefs.autoExit ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
   };
@@ -1279,14 +1294,14 @@ async function launchSubagent(
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
   }
 
-  if (grantSpawning && agentDefs?.subagentAgents) {
+  if (grantSpawning && agentDefs.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
+  if (agentDefs.autoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
@@ -1774,15 +1789,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
         //   • a top-level session → every discoverable agent, i.e. exactly what
         //     `subagents_list` shows.
-        // Every spawn must name an agent in that set. The lone exception is a
-        // top-level `fork: true` clone, which has no role and inherits the
-        // caller's own already-trusted toolset. Without this guard a missing or
-        // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
-          : discoverAgentDefinitions().map((a) => a.name);
-        const permittedSet = new Set(permittedAgents);
+        // Every spawn must name an invocable agent in that resolved set.
+        // Without this guard a missing, hidden, or unknown `agent` could
+        // silently launch without a sandbox profile and inherit full tools.
+        const permittedDefinitions = discoverModelInvocableAgentDefinitions();
+        const permittedAgents = permittedDefinitions.map((agent) => agent.name);
         const permittedList = permittedAgents.join(", ") || "(none)";
+        const selectedAgentDefs = params.agent
+          ? permittedDefinitions.find((agent) => agent.name === params.agent) ?? null
+          : null;
 
         if (!params.agent) {
           return {
@@ -1796,7 +1811,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ],
             details: { error: "agent required" },
           };
-        } else if (!permittedSet.has(params.agent)) {
+        } else if (!selectedAgentDefs) {
           return {
             content: [
               {
@@ -1813,7 +1828,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const selectedAgentDefs = loadAgentDefaults(params.agent);
         warnLegacyClaudeRoleOnce(params.agent, selectedAgentDefs, ctx);
 
         // Validate prerequisites (need mux + a session file to derive the
@@ -1866,10 +1880,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
         params.name = claimed.name;
+        const launchParams: LaunchSubagentParams = { ...params, name: claimed.name };
 
         let running: RunningSubagent;
         try {
-          running = await launchSubagent(params, ctx, { parentArtifactDir });
+          running = await launchSubagent(launchParams, ctx, { parentArtifactDir, agentDefs: selectedAgentDefs });
         } catch (error: any) {
           const launch = error as LaunchFailure;
           const ownershipRisk = launch.ownershipRisk ?? "none";
@@ -2019,7 +2034,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const firstContent = result.content[0];
+        const text = firstContent?.type === "text" ? firstContent.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -2039,7 +2055,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: Type.Object({}),
 
       async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+        const list = discoverModelInvocableAgentDefinitions();
 
         if (list.length === 0) {
           return {
@@ -2083,6 +2099,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
   // ── cancellation tools ──
+  interface CancelSubagentDetails {
+    error?: string;
+    name?: string;
+    status?: "cancelled";
+    surfaceClosed?: boolean;
+  }
+
   pi.registerTool({
     name: "subagent_cancel",
     label: "Cancel Subagent",
@@ -2093,7 +2116,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: Type.Object({
       name: Type.String({ description: "Exact display name of the running subagent to cancel." }),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params): Promise<AgentToolResult<CancelSubagentDetails>> {
       const resolved = resolveRunningByName(params.name ?? "");
       if ("error" in resolved) {
         return {
@@ -2191,7 +2214,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback / error
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const firstContent = result.content[0];
+        const text = firstContent?.type === "text" ? firstContent.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -2265,8 +2289,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const loadout = readSubagentLoadout(sessionPath);
         if (!loadout) {
           const err =
-            `Cannot safely resume "${requestedName}": no sandbox snapshot found for this session ` +
-            `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
+            `Cannot safely resume "${requestedName}": no valid sandbox snapshot found for this session ` +
+            `(it predates sandboxed resume, or its .loadout.json sidecar is missing, malformed, incomplete, or unsupported). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
@@ -2605,6 +2629,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
@@ -2634,6 +2659,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
@@ -2670,8 +2696,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
-
 }
-// test

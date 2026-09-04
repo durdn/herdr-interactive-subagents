@@ -298,8 +298,10 @@ export default function (pi: ExtensionAPI) {
     recorder.beforeProviderRequest();
   });
 
-  pi.on("after_provider_response", () => {
-    recorder.afterProviderResponse();
+  // The current extension API exposes the completed provider response through
+  // the assistant message lifecycle rather than an after-provider hook.
+  pi.on("message_end", (event) => {
+    if (event.message.role === "assistant") recorder.afterProviderResponse();
   });
 
   pi.on("message_update", (event) => {

@@ -1,5 +1,7 @@
-brief.txt
-test/
+.beads/
+.codegraph/
 .memory/
+brief.txt
 config.json
+test/
 *.tgz

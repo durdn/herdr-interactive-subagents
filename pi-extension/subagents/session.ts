@@ -1,6 +1,7 @@
 import {
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -91,7 +92,11 @@ export function seedSubagentSessionFile(params: {
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
  */
+export const SUBAGENT_LOADOUT_VERSION = 1 as const;
+
 export interface SubagentLoadout {
+  /** Runtime schema version for strict, fail-closed resume validation. */
+  version: typeof SUBAGENT_LOADOUT_VERSION;
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
@@ -127,17 +132,95 @@ export function loadoutSidecarPath(sessionFile: string): string {
  * launch before any Herdr mutation instead of silently creating a dead handle.
  */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
+  if (!validateSubagentLoadout(loadout, false)) {
+    throw new Error("Refusing to persist an invalid subagent loadout");
+  }
+  const p = loadoutSidecarPath(sessionFile);
+  const tmp = `${p}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(loadout), "utf8");
+    renameSync(tmp, p);
+  } catch (error) {
+    // writeFileSync can create a partial file before reporting an I/O failure.
+    // Cover both write and rename so no unusable sidecar-shaped temp survives.
+    try { rmSync(tmp, { force: true }); } catch {}
+    throw error;
+  }
 }
 
-/** Read a subagent's loadout snapshot, or null if absent/unparseable. */
+const LOADOUT_FIELDS = [
+  "agent",
+  "toolAllowlist",
+  "model",
+  "thinking",
+  "systemPromptMode",
+  "identity",
+  "spawnable",
+  "autoExit",
+  "cwd",
+  "agentDir",
+] as const;
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+/**
+ * Validate both the current schema and the one safe legacy shape: the exact,
+ * complete pre-version object written by this extension. Legacy data is only
+ * accepted when every field proves the same runtime types and invariants as v1.
+ */
+function validateSubagentLoadout(
+  value: unknown,
+  allowLegacy: boolean,
+): value is SubagentLoadout | Omit<SubagentLoadout, "version"> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const hasVersion = Object.prototype.hasOwnProperty.call(record, "version");
+  if (hasVersion ? record.version !== SUBAGENT_LOADOUT_VERSION : !allowLegacy) return false;
+
+  const expected = new Set<string>([...LOADOUT_FIELDS, ...(hasVersion ? ["version"] : [])]);
+  const keys = Object.keys(record);
+  if (keys.length !== expected.size || keys.some((key) => !expected.has(key))) return false;
+  if (!LOADOUT_FIELDS.every((key) => Object.prototype.hasOwnProperty.call(record, key))) return false;
+
+  if (!isNullableString(record.agent) || !isNullableString(record.toolAllowlist)) return false;
+  // applySandboxToParts intentionally treats null as unrestricted; accepting an
+  // empty string here would be an accidental falsy alias and could fail open.
+  if (typeof record.toolAllowlist === "string" && record.toolAllowlist.trim() === "") return false;
+  if (!isNullableString(record.model) || !isNullableString(record.thinking)) return false;
+  if (!isNullableString(record.identity) || !isNullableString(record.cwd)) return false;
+  if (!isNullableString(record.agentDir) || typeof record.autoExit !== "boolean") return false;
+  if (
+    record.systemPromptMode !== null &&
+    record.systemPromptMode !== "append" &&
+    record.systemPromptMode !== "replace"
+  ) return false;
+  if (record.identity !== null && record.systemPromptMode === null) return false;
+
+  if (record.spawnable !== null) {
+    if (
+      !Array.isArray(record.spawnable) ||
+      record.spawnable.length === 0 ||
+      record.spawnable.some((name) => typeof name !== "string" || name.trim() === "")
+    ) return false;
+    // A spawn whitelist without a tool allowlist could re-enable nested spawning
+    // in an unrestricted process, a shape this runtime never writes.
+    if (record.toolAllowlist === null) return false;
+  }
+  return true;
+}
+
+/** Read and strictly validate a subagent loadout snapshot, or null on any mismatch. */
 export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null {
   try {
     const p = loadoutSidecarPath(sessionFile);
     if (!existsSync(p)) return null;
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as SubagentLoadout;
+    const parsed: unknown = JSON.parse(readFileSync(p, "utf8"));
+    if (!validateSubagentLoadout(parsed, true)) return null;
+    return Object.prototype.hasOwnProperty.call(parsed, "version")
+      ? parsed as SubagentLoadout
+      : { version: SUBAGENT_LOADOUT_VERSION, ...parsed } as SubagentLoadout;
   } catch {
     return null;
   }
@@ -188,23 +271,152 @@ function registryLockPath(artifactDir: string): string {
   return join(artifactDir, "subagent-registry.lock");
 }
 
-function withRegistryLock<T>(artifactDir: string, run: () => T): T {
-  mkdirSync(artifactDir, { recursive: true });
-  const lock = registryLockPath(artifactDir);
-  const deadline = Date.now() + 5000;
+const REGISTRY_LOCK_LEASE_MS = 30_000;
+const REGISTRY_LOCK_WAIT_MS = 5_000;
+const REGISTRY_LOCK_SLEEP = new Int32Array(new SharedArrayBuffer(4));
+
+interface RegistryLockOwner {
+  version: 1;
+  token: string;
+  pid: number;
+  createdAt: string;
+  leaseUntil: number;
+}
+
+interface HeldRegistryLock {
+  path: string;
+  token: string;
+}
+
+function lockProcessState(pid: unknown): "alive" | "dead" | "unknown" {
+  if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return "unknown";
+  try {
+    process.kill(pid as number, 0);
+    return "alive";
+  } catch (error: any) {
+    // EPERM proves the process exists but cannot be signalled. Only ESRCH is
+    // positive evidence that the owner has gone away.
+    if (error?.code === "ESRCH") return "dead";
+    if (error?.code === "EPERM") return "alive";
+    return "unknown";
+  }
+}
+
+function readRegistryLockOwner(path: string): RegistryLockOwner | null {
+  try {
+    const value: unknown = JSON.parse(readFileSync(join(path, "owner.json"), "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const owner = value as Record<string, unknown>;
+    if (
+      owner.version !== 1 ||
+      typeof owner.token !== "string" ||
+      !/^[a-zA-Z0-9-]+$/.test(owner.token) ||
+      !Number.isSafeInteger(owner.pid) ||
+      (owner.pid as number) <= 0 ||
+      typeof owner.createdAt !== "string" ||
+      !Number.isFinite(owner.leaseUntil)
+    ) return null;
+    return owner as unknown as RegistryLockOwner;
+  } catch {
+    return null;
+  }
+}
+
+function registryLockIsReclaimable(path: string): boolean {
+  const owner = readRegistryLockOwner(path);
+  if (owner) {
+    if (existsSync(join(path, `released-${owner.token}`))) return true;
+    const processState = lockProcessState(owner.pid);
+    if (processState === "dead") return true;
+    // Never evict a known-live owner based only on elapsed wall time. The lease
+    // is a fallback for platforms where process liveness cannot be established.
+    if (processState === "alive") return false;
+    return owner.leaseUntil <= Date.now();
+  }
+
+  // mkdir and atomic owner publication are separate operations. A missing or
+  // partially-written owner is only stale once the directory itself has aged
+  // past the lease, avoiding takeover during that short publication window.
+  try {
+    return lstatSync(path).mtimeMs + REGISTRY_LOCK_LEASE_MS <= Date.now();
+  } catch {
+    return true;
+  }
+}
+
+function reclaimRegistryLock(path: string): boolean {
+  const stale = `${path}.stale-${process.pid}-${randomUUID()}`;
+  try {
+    // Rename is the generation hand-off. Exactly one waiter can retire this
+    // canonical directory, and a delayed release from its old owner cannot
+    // remove a successor generation created at the canonical path.
+    renameSync(path, stale);
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return true;
+    return false;
+  }
+  try { rmSync(stale, { recursive: true, force: true }); } catch {}
+  return true;
+}
+
+function acquireRegistryLock(path: string): HeldRegistryLock {
+  const deadline = Date.now() + REGISTRY_LOCK_WAIT_MS;
   for (;;) {
+    const token = randomUUID();
     try {
-      mkdirSync(lock);
-      break;
+      mkdirSync(path);
     } catch (error: any) {
-      if (error?.code !== "EEXIST" || Date.now() >= deadline) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      if (error?.code !== "EEXIST") throw error;
+      if (registryLockIsReclaimable(path) && reclaimRegistryLock(path)) continue;
+      if (Date.now() >= deadline) throw error;
+      Atomics.wait(REGISTRY_LOCK_SLEEP, 0, 0, 10);
+      continue;
+    }
+
+    const owner: RegistryLockOwner = {
+      version: 1,
+      token,
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      leaseUntil: Date.now() + REGISTRY_LOCK_LEASE_MS,
+    };
+    try {
+      // `wx` prevents a creator that was suspended after mkdir from waking up
+      // and overwriting a successor generation's owner record. Verify the token
+      // as well: the canonical path may have been retired and recreated between
+      // mkdir and this write.
+      writeFileSync(join(path, "owner.json"), JSON.stringify(owner), { flag: "wx" });
+      if (readRegistryLockOwner(path)?.token === token) return { path, token };
+    } catch (error: any) {
+      if (!["EEXIST", "ENOENT"].includes(error?.code)) throw error;
+    }
+    // Never remove the canonical path here: it may already belong to a
+    // successor. Retry acquisition and let lease-based recovery retire any
+    // genuinely unpublished generation.
+    if (Date.now() >= deadline) {
+      throw new Error(`Could not publish subagent registry lock ownership at ${path}`);
     }
   }
+}
+
+function releaseRegistryLock(held: HeldRegistryLock): void {
+  try {
+    // Do not recursively delete the canonical path: it may already represent a
+    // successor generation after stale takeover. A token marker lets the next
+    // waiter retire only the generation whose owner token matches.
+    writeFileSync(join(held.path, `released-${held.token}`), "", { flag: "wx" });
+  } catch {
+    // A stale takeover may already have moved or removed our generation.
+  }
+}
+
+function withRegistryLock<T>(artifactDir: string, run: () => T): T {
+  mkdirSync(artifactDir, { recursive: true });
+  const held = acquireRegistryLock(registryLockPath(artifactDir));
   try {
     return run();
   } finally {
-    rmSync(lock, { recursive: true, force: true });
+    releaseRegistryLock(held);
   }
 }
 

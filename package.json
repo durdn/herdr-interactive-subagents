@@ -13,10 +13,21 @@
     "url": "https://github.com/durdn/herdr-interactive-subagents"
   },
   "type": "module",
+  "files": [
+    "agents/",
+    "claude-plugin/",
+    "config.json.example",
+    "docs/",
+    "herdr-plugin.toml",
+    "pi-extension/",
+    "roles/",
+    "scripts/"
+  ],
   "scripts": {
     "roles:generate": "node scripts/roles.mjs generate",
     "roles:check": "node scripts/roles.mjs check",
-    "test": "npm run roles:check && node --test test/roles.test.mjs test/test.ts test/claude-orchestrator.test.mjs",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "npm run roles:check && node --test test/roles.test.mjs test/test.ts test/web-tools.test.ts test/claude-orchestrator.test.mjs",
     "test:surface": "node --test --test-concurrency=1 test/integration/herdr-surface.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
     "prepack": "npm run roles:check"
@@ -34,6 +45,8 @@
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "^0.65.0",
     "@mariozechner/pi-tui": "^0.65.0",
-    "@sinclair/typebox": "^0.34.49"
+    "@sinclair/typebox": "^0.34.49",
+    "@types/node": "^25.9.5",
+    "typescript": "^5.9.3"
   }
 }

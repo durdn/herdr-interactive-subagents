@@ -9,7 +9,7 @@ const LEGACY_CLAUDE_DEPRECATION =
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
-interface AgentDefaults {
+export interface AgentDefaults {
   model?: string;
   tools?: string;
   skills?: string;
@@ -33,13 +33,13 @@ interface AgentDefaults {
 
 type AgentSource = "package" | "global" | "project";
 
-interface AgentDefinition extends AgentDefaults {
+export interface AgentDefinition extends AgentDefaults {
   name: string;
   description?: string;
   disableModelInvocation: boolean;
 }
 
-interface ListedAgentDefinition extends AgentDefinition {
+export interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
   deprecated?: true;
   deprecation?: string;
@@ -128,7 +128,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   };
 }
 
-export function discoverAgentDefinitions(): ListedAgentDefinition[] {
+function resolveAgentDefinitionsByName(): Map<string, ListedAgentDefinition> {
   const agents = new Map<string, ListedAgentDefinition>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
@@ -136,9 +136,14 @@ export function discoverAgentDefinitions(): ListedAgentDefinition[] {
     { path: join(process.cwd(), ".pi", "agents"), source: "project" },
   ];
 
+  // This is the authoritative name and precedence resolver for both listing
+  // and loading. Definitions are keyed by parsed frontmatter name (falling
+  // back to the filename only when name is absent), with project > global >
+  // package precedence. Sorting makes duplicate names within one source
+  // deterministic as well.
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
-    for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
+    for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md")).sort()) {
       const parsed = parseAgentDefinition(
         readFileSync(join(dir, file), "utf8"),
         file.replace(/\.md$/, ""),
@@ -153,11 +158,25 @@ export function discoverAgentDefinitions(): ListedAgentDefinition[] {
       });
     }
   }
+  return agents;
+}
 
-  // When this process is itself a restricted subagent, only expose the agents
-  // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
-  const all = [...agents.values()];
+export function discoverAgentDefinitions(): ListedAgentDefinition[] {
+  const all = [...resolveAgentDefinitionsByName().values()];
+  // A restricted child may only discover its pinned names. This filtering is
+  // shared by listing and model-invocation resolution rather than being
+  // reimplemented by the launch path.
   return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
+}
+
+/** Definitions that a model is permitted to name in a `subagent` tool call. */
+export function discoverModelInvocableAgentDefinitions(): ListedAgentDefinition[] {
+  return discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+}
+
+/** Resolve a model-invocable definition using the exact listing resolver. */
+export function loadModelInvocableAgent(agentName: string): ListedAgentDefinition | null {
+  return discoverModelInvocableAgentDefinitions().find((agent) => agent.name === agentName) ?? null;
 }
 
 function isAbsoluteSubagentPath(path: string): boolean {
@@ -283,19 +302,11 @@ export function warnLegacyClaudeRoleOnce(
   return true;
 }
 
+/**
+ * Direct definition loading intentionally includes disable-model-invocation
+ * roles (for trusted user/extension workflows), but uses the same canonical
+ * frontmatter-name and source-precedence resolver as discovery.
+ */
 export function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const configDir = getAgentConfigDir();
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
-    join(getBundledAgentsDir(), `${agentName}.md`),
-  ];
-
-  for (const path of paths) {
-    if (!existsSync(path)) continue;
-    const parsed = parseAgentDefinition(readFileSync(path, "utf8"), agentName);
-    if (parsed) return parsed;
-  }
-
-  return null;
+  return resolveAgentDefinitionsByName().get(agentName) ?? null;
 }

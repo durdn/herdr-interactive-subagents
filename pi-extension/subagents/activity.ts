@@ -286,6 +286,9 @@ export function createSubagentActivityRecorder(params: {
   const runningChildId = params.runningChildId?.trim();
   const activityFile = params.activityFile?.trim();
   if (!runningChildId || !activityFile) return createNoopRecorder();
+  // Preserve the validated path across the recorder's nested callbacks. The
+  // optional input itself is not safely narrowed once captured by a closure.
+  const validatedActivityFile: string = activityFile;
 
   const now = params.now ?? (() => Date.now());
   const createdAt = now();
@@ -322,7 +325,7 @@ export function createSubagentActivityRecorder(params: {
   function flushNow(): void {
     if (disabled) return;
     try {
-      writeSubagentActivityFile(activityFile, activity);
+      writeSubagentActivityFile(validatedActivityFile, activity);
       lastFlushAt = now();
       failureCount = 0;
     } catch {

@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, rmSync, existsSync, utimesSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -33,6 +33,7 @@ import {
   tryClaimSession,
   writeSubagentLoadout,
   loadoutSidecarPath,
+  SUBAGENT_LOADOUT_VERSION,
   type SubagentLoadout,
   findLastAssistantMessage,
   seedSubagentSessionFile,
@@ -284,6 +285,7 @@ describe("session.ts", () => {
 
   describe("subagent loadout snapshot", () => {
     const sample: SubagentLoadout = {
+      version: SUBAGENT_LOADOUT_VERSION,
       agent: "worker",
       toolAllowlist: "read,write,edit,safe_bash,web_search,subagent,ask_question",
       model: "openrouter/z-ai/glm-5.2",
@@ -317,6 +319,63 @@ describe("session.ts", () => {
       const sf = join(dir, "s3.jsonl");
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null);
+    });
+
+    it("rejects empty, incomplete, extra-field, and unsupported-version loadouts", () => {
+      const sf = join(dir, "strict.jsonl");
+      for (const invalid of [
+        {},
+        { version: SUBAGENT_LOADOUT_VERSION },
+        { ...sample, extra: true },
+        { ...sample, version: 999 },
+        { ...sample, autoExit: "true" },
+        { ...sample, toolAllowlist: "" },
+        { ...sample, identity: "unsafe", systemPromptMode: null },
+        { ...sample, spawnable: ["scout"], toolAllowlist: null },
+      ]) {
+        writeFileSync(loadoutSidecarPath(sf), JSON.stringify(invalid), "utf8");
+        assert.equal(readSubagentLoadout(sf), null, `expected rejection: ${JSON.stringify(invalid)}`);
+      }
+    });
+
+    it("accepts only the complete legacy unversioned shape and upgrades it in memory", () => {
+      const sf = join(dir, "legacy.jsonl");
+      const { version: _version, ...legacy } = sample;
+      writeFileSync(loadoutSidecarPath(sf), JSON.stringify(legacy), "utf8");
+      assert.deepEqual(readSubagentLoadout(sf), sample);
+
+      const { agent: _agent, ...incompleteLegacy } = legacy;
+      writeFileSync(loadoutSidecarPath(sf), JSON.stringify(incompleteLegacy), "utf8");
+      assert.equal(readSubagentLoadout(sf), null);
+    });
+
+    it("persists atomically without leaving temporary sidecars", () => {
+      const sf = join(dir, "atomic.jsonl");
+      writeSubagentLoadout(sf, sample);
+      assert.equal(
+        readdirSync(dir).some((name) => name.startsWith("atomic.jsonl.loadout.json.tmp-")),
+        false,
+      );
+    });
+
+    it("refuses to persist a runtime-invalid loadout", () => {
+      const sf = join(dir, "invalid-write.jsonl");
+      assert.throws(
+        () => writeSubagentLoadout(sf, { ...sample, toolAllowlist: "" } as SubagentLoadout),
+        /invalid subagent loadout/i,
+      );
+      assert.equal(existsSync(loadoutSidecarPath(sf)), false);
+    });
+
+    it("cleans up the temp path when sidecar writing itself fails", () => {
+      const blockedParent = join(dir, "loadout-parent-is-a-file");
+      writeFileSync(blockedParent, "not a directory", "utf8");
+      const sf = join(blockedParent, "child.jsonl");
+      assert.throws(() => writeSubagentLoadout(sf, sample));
+      assert.equal(
+        readdirSync(dir).some((name) => name.includes("child.jsonl.loadout.json.tmp-")),
+        false,
+      );
     });
 
     it("surfaces loadout persistence failure instead of creating a non-resumable handle", () => {
@@ -367,6 +426,62 @@ describe("session.ts", () => {
       assert.equal(releaseOwnershipClaim(session!), true);
       assert.equal(releaseOwnershipClaim(session!), true, "release should be idempotent once absent");
       assert.ok(tryClaimSession(adir, join(dir, "worker.jsonl"), "worker"));
+    });
+
+    it("reclaims crashed and stale registry lock generations without touching durable claims", () => {
+      const adir = join(dir, "art-stale-registry-lock");
+      const durable = tryClaimName(adir, "durably-owned");
+      assert.ok(durable);
+
+      const lock = join(adir, "subagent-registry.lock");
+      mkdirSync(lock, { recursive: true });
+      writeFileSync(join(lock, "owner.json"), JSON.stringify({
+        version: 1,
+        token: "crashed-owner",
+        pid: 2_147_483_647,
+        createdAt: new Date().toISOString(),
+        leaseUntil: Date.now() + 60_000,
+      }));
+
+      registerName(adir, "after-crash", { sessionFile: "/s/after-crash.jsonl", sessionId: "crash" });
+      // Normal release leaves a token marker. A second writer must retire that
+      // generation atomically and preserve the first update.
+      registerName(adir, "after-release", { sessionFile: "/s/after-release.jsonl", sessionId: "release" });
+      assert.deepEqual(Object.keys(readNameRegistry(adir)).sort(), ["after-crash", "after-release"]);
+
+      // Exercise the conservative fallback for an old partial/malformed owner
+      // record where PID liveness cannot be proven.
+      rmSync(lock, { recursive: true, force: true });
+      mkdirSync(lock);
+      writeFileSync(join(lock, "owner.json"), "{partial", "utf8");
+      const old = new Date(Date.now() - 31_000);
+      utimesSync(lock, old, old);
+      registerName(adir, "after-partial", { sessionFile: "/s/after-partial.jsonl", sessionId: "partial" });
+
+      assert.equal(tryClaimName(adir, "durably-owned"), null);
+      assert.equal(readOwnershipClaims(adir, "name").some((claim) => claim.key === "durably-owned"), true);
+      assert.equal(resolveNameInRegistry(adir, "after-partial")?.sessionId, "partial");
+    });
+
+    it("serializes concurrent registry writers without losing either update", async () => {
+      const adir = join(dir, "art-registry-process-race");
+      const moduleUrl = new URL("../pi-extension/subagents/session.ts", import.meta.url).href;
+      const code = [
+        `const m = await import(${JSON.stringify(moduleUrl)});`,
+        `m.registerName(process.argv[1], process.argv[2], { sessionFile: process.argv[3], sessionId: process.argv[2] });`,
+      ].join("\n");
+      const launch = (name: string) => new Promise<number | null>((resolveRun, reject) => {
+        const child = spawn(
+          process.execPath,
+          ["--input-type=module", "--eval", code, adir, name, `/s/${name}.jsonl`],
+          { stdio: ["ignore", "ignore", "inherit"] },
+        );
+        child.on("error", reject);
+        child.on("close", resolveRun);
+      });
+
+      assert.deepEqual(await Promise.all([launch("one"), launch("two")]), [0, 0]);
+      assert.deepEqual(Object.keys(readNameRegistry(adir)).sort(), ["one", "two"]);
     });
 
     it("allows only one subprocess to claim a Pi transcript", async () => {
@@ -1314,6 +1429,7 @@ describe("subagent discovery", () => {
       testApi.applySandboxToParts(
         parts,
         {
+          version: SUBAGENT_LOADOUT_VERSION,
           agent: "worker",
           toolAllowlist: "read,write,safe_bash",
           model: "openrouter/z-ai/glm-5.2",
@@ -1351,6 +1467,7 @@ describe("subagent discovery", () => {
       testApi.applySandboxToParts(
         parts,
         {
+          version: SUBAGENT_LOADOUT_VERSION,
           agent: null,
           toolAllowlist: null,
           model: null,
@@ -1438,6 +1555,54 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("uses frontmatter names as the canonical key for both discovery and loading", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "different-filename",
+        [
+          "name: canonical-agent-name",
+          "description: Renamed fixture",
+          "model: anthropic/canonical",
+        ].join("\n"),
+        "Canonical identity.",
+      );
+
+      const discovered = testApi.discoverAgentDefinitions();
+      assert.ok(discovered.some((agent: any) => agent.name === "canonical-agent-name"));
+      assert.equal(discovered.some((agent: any) => agent.name === "different-filename"), false);
+      assert.equal(testApi.loadAgentDefaults("canonical-agent-name")?.body, "Canonical identity.");
+      assert.equal(testApi.loadModelInvocableAgent("canonical-agent-name")?.model, "anthropic/canonical");
+      assert.equal(testApi.loadAgentDefaults("different-filename"), null);
+      assert.equal(testApi.loadModelInvocableAgent("different-filename"), null);
+    });
+  });
+
+  it("applies project precedence by canonical frontmatter name even when filenames differ", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+      writeAgentFile(
+        globalAgentsDir,
+        "global-file",
+        "name: shared-canonical-name\nmodel: anthropic/global",
+        "Global identity.",
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "project-file",
+        "name: shared-canonical-name\nmodel: anthropic/project",
+        "Project identity.",
+      );
+
+      const matches = testApi.discoverAgentDefinitions().filter(
+        (agent: any) => agent.name === "shared-canonical-name",
+      );
+      assert.equal(matches.length, 1);
+      assert.equal(matches[0].source, "project");
+      assert.equal(testApi.loadAgentDefaults("shared-canonical-name")?.model, "anthropic/project");
+      assert.equal(testApi.loadAgentDefaults("shared-canonical-name")?.body, "Project identity.");
+    });
+  });
+
   it("marks legacy Claude roles deprecated in listing metadata and output", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1496,6 +1661,15 @@ describe("subagent discovery", () => {
       assert.equal(loaded.model, "anthropic/test-hidden");
       assert.equal(loaded.body, "You are the hidden agent.");
       assert.equal(loaded.disableModelInvocation, true);
+
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      const spawnResult = await subagentTool.execute("call-hidden", {
+        agent: "hidden-discovery-test-agent",
+        name: "hidden",
+        task: "run hidden role",
+      });
+      assert.equal(spawnResult.details?.error, "unknown agent");
+      assert.match(spawnResult.content[0].text, /not a known agent/i);
     });
   });
 

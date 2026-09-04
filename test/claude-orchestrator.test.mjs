@@ -690,6 +690,9 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
     assert.ok(names.includes("scripts/roles.mjs"));
     assert.ok(names.includes("roles/catalog.json"));
     assert.ok(names.includes("roles/README.md"));
+    assert.ok(names.includes(".codex-plugin/plugin.json"));
+    assert.ok(names.includes("skills/herdr-subagents/SKILL.md"));
+    assert.ok(names.includes("skills/herdr-subagents/agents/openai.yaml"));
     assert.deepEqual(
       names.filter((name) => name.startsWith("agents/") && name.endsWith(".md")).sort(),
       ["agents/researcher.md", "agents/scout.md", "agents/worker.md"],
@@ -701,6 +704,15 @@ describe("Claude orchestrator no-model CLI", { concurrency: false }, () => {
         "claude-plugin/agents/reviewer.md",
         "claude-plugin/agents/scout.md",
         "claude-plugin/agents/worker.md",
+      ],
+    );
+    assert.deepEqual(
+      names.filter((name) => name.startsWith("skills/herdr-subagents/references/") && name.endsWith(".md")).sort(),
+      [
+        "skills/herdr-subagents/references/researcher.md",
+        "skills/herdr-subagents/references/reviewer.md",
+        "skills/herdr-subagents/references/scout.md",
+        "skills/herdr-subagents/references/worker.md",
       ],
     );
     assert.equal(names.some((name) => name === "brief.txt" || name.startsWith("test/")), false);

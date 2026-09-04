@@ -1,0 +1,23 @@
+{
+  "name": "herdr-interactive-subagents",
+  "version": "4.0.1",
+  "description": "Role-based Codex subagent orchestration for sessions running in Herdr",
+  "author": {
+    "name": "Amos Blomqvist",
+    "url": "https://github.com/durdn"
+  },
+  "homepage": "https://github.com/durdn/herdr-interactive-subagents#readme",
+  "repository": "https://github.com/durdn/herdr-interactive-subagents",
+  "license": "MIT",
+  "keywords": ["codex", "herdr", "subagents", "delegation"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Herdr Interactive Subagents",
+    "shortDescription": "Coordinate focused Codex subagent threads",
+    "longDescription": "Delegate reconnaissance, research, implementation, and review through Codex-native subagent threads with explicit lifecycle and coordination rules.",
+    "developerName": "Amos Blomqvist",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive"],
+    "defaultPrompt": "Use $herdr-subagents to delegate this task across focused Codex agents."
+  }
+}

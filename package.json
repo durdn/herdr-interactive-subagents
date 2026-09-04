@@ -1,10 +1,13 @@
 {
   "name": "herdr-interactive-subagents",
   "version": "4.0.1",
-  "description": "Herdr-native interactive subagents for pi, running in sibling tabs in the orchestrator's workspace",
+  "description": "Role-based interactive subagents for pi, Claude Code, and Codex, integrated with Herdr",
   "keywords": [
     "pi-package",
-    "herdr-plugin"
+    "herdr-plugin",
+    "codex-plugin",
+    "claude-code",
+    "subagents"
   ],
   "license": "MIT",
   "author": "Amos Blomqvist",
@@ -14,6 +17,7 @@
   },
   "type": "module",
   "files": [
+    ".codex-plugin/",
     "agents/",
     "claude-plugin/",
     "config.json.example",
@@ -21,13 +25,14 @@
     "herdr-plugin.toml",
     "pi-extension/",
     "roles/",
-    "scripts/"
+    "scripts/",
+    "skills/"
   ],
   "scripts": {
     "roles:generate": "node scripts/roles.mjs generate",
     "roles:check": "node scripts/roles.mjs check",
     "typecheck": "tsc --project tsconfig.json",
-    "test": "npm run roles:check && node --test test/roles.test.mjs test/test.ts test/web-tools.test.ts test/claude-orchestrator.test.mjs",
+    "test": "npm run roles:check && node --test test/roles.test.mjs test/test.ts test/web-tools.test.ts test/claude-orchestrator.test.mjs test/codex-plugin.test.mjs",
     "test:surface": "node --test --test-concurrency=1 test/integration/herdr-surface.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
     "prepack": "npm run roles:check"

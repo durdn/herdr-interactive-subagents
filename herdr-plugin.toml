@@ -2,7 +2,7 @@ id = "durdn.interactive-subagents"
 name = "Interactive Subagents"
 version = "4.0.1"
 min_herdr_version = "0.8.0"
-description = "Run pi subagents in background tabs in the orchestrator's Herdr workspace"
+description = "Role-based subagent workflows for pi, Claude Code, and Codex in Herdr"
 platforms = ["linux", "macos", "windows"]
 
 [[actions]]

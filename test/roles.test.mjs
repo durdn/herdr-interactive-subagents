@@ -30,6 +30,10 @@ describe("canonical bundled role catalog", () => {
       catalog.roles.filter((entry) => entry.adapters.claude).map((entry) => entry.name),
       ["scout", "researcher", "worker", "reviewer"],
     );
+    assert.deepEqual(
+      catalog.roles.filter((entry) => entry.adapters.codex).map((entry) => entry.name),
+      ["scout", "researcher", "worker", "reviewer"],
+    );
   });
 
   it("keeps Pi sandbox and autonomy semantics explicit", () => {
@@ -77,5 +81,30 @@ describe("canonical bundled role catalog", () => {
       ],
     );
     assert.match(role("reviewer", "claude").prompt, /You do not fix anything/);
+  });
+
+  it("keeps Codex role defaults and native parent coordination explicit", () => {
+    for (const name of ["scout", "researcher", "worker", "reviewer"]) {
+      const definition = role(name, "codex");
+      assert.equal(definition.fields.name, name);
+      assert.match(definition.prompt, /no knowledge of the parent conversation/);
+      assert.match(definition.prompt, /message the parent with one concise question/);
+      assert.match(definition.prompt, /Result requirements/);
+    }
+
+    assert.deepEqual(
+      catalog.roles.map((entry) => {
+        const definition = role(entry.name, "codex");
+        return [entry.name, definition.fields.model, definition.fields.reasoning, definition.fields.access];
+      }),
+      [
+        ["scout", "gpt-5.6-terra", "low", "read-only"],
+        ["researcher", "gpt-5.6-terra", "medium", "read-only"],
+        ["worker", "gpt-5.6-sol", "high", "inherited writable"],
+        ["reviewer", "gpt-5.6-sol", "high", "read-only"],
+      ],
+    );
+    assert.match(role("worker", "codex").prompt, /scout or external research to a researcher/);
+    assert.match(role("reviewer", "codex").prompt, /without fixing anything/);
   });
 });

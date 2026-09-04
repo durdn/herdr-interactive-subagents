@@ -22,7 +22,10 @@ if (args[0] === "--version") {
   process.exit(0);
 }
 if (args[0] === "pane" && args[1] === "current") {
-  json({ result: { pane: { workspace_id: process.env.HS_FAKE_WORKSPACE || "w-test" } } });
+  json({ result: { pane: {
+    workspace_id: process.env.HS_FAKE_WORKSPACE || "w-test",
+    pane_id: process.env.HS_FAKE_PARENT_PANE || "w-test:p0",
+  } } });
 }
 if (args[0] === "agent" && args[1] === "list") {
   json({ result: { agents: state.live || [] } });
@@ -53,8 +56,11 @@ if (args[0] === "agent" && args[1] === "start") {
     json({ error: { code: "agent_not_ready", message: "fake startup failure" } }, 1);
   }
   const name = args[2];
-  const sessionId = args[args.indexOf("--session-id") + 1]
-    || args[args.indexOf("--resume") + 1] || null;
+  const sessionIndex = args.indexOf("--session-id");
+  const resumeIndex = args.indexOf("--resume");
+  const sessionId = sessionIndex >= 0
+    ? args[sessionIndex + 1]
+    : resumeIndex >= 0 ? args[resumeIndex + 1] : null;
   // Herdr assigns the agent name only when a start is detected cleanly, so a
   // child that missed detection is live and nameless - reachable by pane only.
   const nameless = process.env.HS_FAKE_START_NAMELESS === "1";
@@ -90,6 +96,20 @@ if (args[0] === "pane" && args[1] === "read") {
 if (args[0] === "agent" && args[1] === "read") {
   console.log("fake child screen");
   process.exit(0);
+}
+if (args[0] === "agent" && args[1] === "prompt") {
+  const agent = (state.live || []).find((item) =>
+    item.name === args[2] || item.pane_id === args[2]);
+  if (!agent) json({ error: { code: "agent_not_found" } }, 1);
+  agent.agent_status = "done";
+  agent.agent_session ||= { value: "fake-codex-session" };
+  json({ result: { agent, type: "agent_prompted" } });
+}
+if (args[0] === "agent" && args[1] === "wait") {
+  const agent = (state.live || []).find((item) =>
+    item.name === args[2] || item.pane_id === args[2]);
+  if (!agent) json({ error: { code: "agent_not_found" } }, 1);
+  json({ result: { agent, type: "agent_waited" } });
 }
 if (args[0] === "tab" && args[1] === "close") {
   if (process.env.HS_FAKE_CLOSE_FAILURE === "1") {

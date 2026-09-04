@@ -5,9 +5,9 @@
 > longer: cross-session `SendMessage`, `notify_when_idle`, `--session-id`/`--resume`, and role
 > definitions cover every gap the table below lists. The shipped design and the spike that
 > verified it are in [`claude-orchestrator.md`](claude-orchestrator.md). Kept for the reasoning.
-> Codex now has a third answer: native subagent threads supply the orchestration lifecycle without
-> external sessions, while intentionally giving up one-Herdr-tab-per-child topology. See
-> [`codex-orchestrator.md`](codex-orchestrator.md).
+> Codex now has a third answer: a small launcher bundled inside the skill supplies parent ownership,
+> permission propagation, a lifecycle watcher, and transcript retrieval around Herdr's native tab
+> and agent commands. See [`codex-orchestrator.md`](codex-orchestrator.md).
 
 ## Question
 

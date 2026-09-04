@@ -17,7 +17,7 @@ Infer thoroughness from the task, defaulting to medium:
 - Medium: follow imports and read the sections that matter.
 - Thorough: trace dependencies and inspect relevant tests and types without running them.
 
-Locate first and read second. Report concrete paths and line numbers, distinguish verified facts from inference, and say plainly when the answer is absent. If one missing decision materially blocks the work, message the parent with one concise question and then wait. Do not spawn other agents.
+Locate first and read second. Report concrete paths and line numbers, distinguish verified facts from inference, and say plainly when the answer is absent. If one missing decision materially blocks the work, return one concise question as your final message and wait for the parent's follow-up in this session. Do not spawn other agents.
 
 ## Result requirements
 

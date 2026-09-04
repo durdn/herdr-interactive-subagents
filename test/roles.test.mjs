@@ -83,12 +83,12 @@ describe("canonical bundled role catalog", () => {
     assert.match(role("reviewer", "claude").prompt, /You do not fix anything/);
   });
 
-  it("keeps Codex role defaults and native parent coordination explicit", () => {
+  it("keeps Codex role defaults and visible-session follow-up coordination explicit", () => {
     for (const name of ["scout", "researcher", "worker", "reviewer"]) {
       const definition = role(name, "codex");
       assert.equal(definition.fields.name, name);
       assert.match(definition.prompt, /no knowledge of the parent conversation/);
-      assert.match(definition.prompt, /message the parent with one concise question/);
+      assert.match(definition.prompt, /return one concise question as your final message/);
       assert.match(definition.prompt, /Result requirements/);
     }
 

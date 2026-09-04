@@ -1,4 +1,4 @@
 interface:
   display_name: "Herdr Subagents"
-  short_description: "Delegate work through Codex-native subagent threads"
+  short_description: "Delegate Codex work in visible Herdr tabs"
   default_prompt: "Use $herdr-subagents to delegate this work across focused agents."

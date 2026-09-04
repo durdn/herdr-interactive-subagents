@@ -1,6 +1,6 @@
 {
   "name": "herdr-interactive-subagents",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "description": "Role-based interactive subagents for pi, Claude Code, and Codex, integrated with Herdr",
   "keywords": [
     "pi-package",

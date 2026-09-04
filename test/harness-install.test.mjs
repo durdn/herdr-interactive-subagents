@@ -34,6 +34,8 @@ function fixture() {
   const source = join(root, "skills", "herdr-subagents");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "SKILL.md"), "---\nname: herdr-subagents\ndescription: test\n---\n");
+  mkdirSync(join(source, "scripts"));
+  writeFileSync(join(source, "scripts", "codex-subagents.mjs"), "// test launcher\n");
   return { dir, root, home, source };
 }
 

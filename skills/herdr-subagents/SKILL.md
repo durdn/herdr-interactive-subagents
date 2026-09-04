@@ -1,40 +1,76 @@
 ---
 name: herdr-subagents
-description: Coordinate explicit user-requested delegation through Codex-native subagent threads while the orchestrator runs in Herdr. Use when the user asks to delegate to scouts, researchers, workers, or reviewers; requests parallel agents; or wants to list, steer, resume, wait for, or stop Codex children. Do not trigger merely because ordinary work could benefit from parallelism.
+description: Delegate explicit user-requested work to independent Codex sessions in visible Herdr tabs and coordinate their prompts, results, follow-ups, and cleanup. Use when the user asks for Herdr agents, visible subagent tabs, scouts/researchers/workers/reviewers, parallel agents, or to list, steer, resume, wait for, or stop those children. Requires HERDR_ENV=1. Do not trigger merely because ordinary work could benefit from parallelism.
 ---
 
 # Herdr subagents for Codex
 
-Use Codex's native collaboration runtime for orchestration. It already owns child identities,
-thread persistence, message delivery, completion notifications, nesting, waiting, and cleanup.
-Do not create a second registry or poll Herdr terminal state for native Codex children.
+Each child is a full Codex session in a background tab in the current Herdr workspace. The user
+can watch it, focus it, or take it over. Use the bundled launcher for the entire lifecycle; it
+records which tabs this parent owns, routes prompts through Herdr, retrieves the child's Codex
+transcript, and refuses to close tabs owned by another session.
 
-## Topology
+This visible topology is intentionally separate from Codex's native subagent tree. Do not use the
+native collaboration spawn operation for a request covered by this skill: native children do not
+occupy Herdr tabs. Do not claim that a Herdr child has a native child-thread handle.
 
-Native Codex children are inspectable agent threads under the current Codex session. They share
-the parent's repository and live permission policy, and users can inspect them through Codex's
-Subagents UI or `/agent` in the CLI.
+## Launcher
 
-They are not independent terminal processes, so Herdr sees the parent Codex process in one pane;
-it does not show one Herdr tab per native child. If the user explicitly requires separate Herdr
-terminal tabs, explain this boundary. Do not launch unrelated `codex` CLI sessions and imply that
-they belong to the native agent tree: they have no documented parent mailbox or thread handle.
+Use this stable path from every checkout installed by the cross-harness installer:
 
-When the request specifically depends on Herdr, verify `HERDR_ENV=1` before using Herdr commands.
-Native Codex delegation itself does not need a Herdr control command.
+```powershell
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs
+```
 
-## Pick and load a role
+Do not search for the script or make an ad-hoc link. `spawn` validates Herdr, the role, the working
+directory, the Windows Codex executable, and the parent's live permission profile itself. Run
+`doctor` only after a failure, not as a warm-up.
 
-Read exactly one matching role reference before each distinct role is first spawned in the turn:
+## Spawn
 
-- `references/scout.md` for read-only codebase reconnaissance.
-- `references/researcher.md` for sourced external research.
-- `references/worker.md` for a bounded implementation task.
-- `references/reviewer.md` for read-only defect review.
+Give the child a complete brief because it inherits none of the parent conversation:
 
-Pass the role body and the complete task together in the spawn message. A child does not inherit
-the parent conversation unless the active spawn surface explicitly forks recent turns, so prefer
-a self-contained task even when forking is available.
+```powershell
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs spawn `
+  --role scout --name auth-scout --cwd "<absolute working directory>" `
+  --task "<complete task, constraints, expected output, and verification>"
+```
+
+The command creates a background tab, launches Codex, submits the task, starts a completion
+watcher, and returns. Keep the returned name. For independent work, launch the spawn commands
+concurrently when the active command surface supports it. Otherwise launch them one after another;
+never make concurrent workers edit the same files.
+
+Three to five children is usually the useful range. Each is a separate Codex session with its own
+context and model usage. Use fewer when the tasks share state or require serial decisions.
+
+The launcher writes the role and task to its parent-scoped temporary brief directory, then submits
+one short instruction telling Codex to read that file. This avoids Codex's bracketed-paste threshold,
+where a long direct prompt can remain in the composer without Enter being consumed. Quotes and
+newlines in `--task` are safe; use `--task-file <path>` if the calling shell's argv limit is a risk.
+
+## Permissions
+
+The launcher reads the leader's live `CODEX_PERMISSION_PROFILE` and converts it to explicit Codex
+CLI options because a new terminal process does not inherit the host's in-memory permission mode:
+
+- `:danger-full-access` launches the child with
+  `--dangerously-bypass-approvals-and-sandbox`, so full access means no repeated approvals.
+- `:workspace` launches with `workspace-write` and on-request approvals.
+- `:read-only` launches with a read-only sandbox and on-request approvals.
+- A named custom profile is forwarded through Codex's `default_permissions` setting.
+
+This is a security boundary, not just wording in the prompt. Never broaden or override the
+leader's profile unless the user explicitly changes the leader's permissions. Role access labels
+remain behavioral contracts inside that inherited boundary; a `scout` stays read-only by
+instruction even when the user gave the whole agent tree full access.
+
+On Windows, npm commonly installs `codex` as a `.ps1`/`.cmd` shim. Herdr starts agents with
+PowerShell `Start-Process`, which cannot execute that shim directly. The launcher resolves the
+package's real `codex.exe` and prepends only its directory to the new tab's `PATH`. If an unusual
+installation cannot be resolved, set `HERDR_CODEX_EXE` to the installed `codex.exe` and rerun.
+
+## Roles
 
 <!-- BEGIN GENERATED: codex-skill-role-table -->
 <!-- Generated by `npm run roles:generate` from `roles/catalog.json`; do not edit this file directly. -->
@@ -46,57 +82,72 @@ a self-contained task even when forking is available.
 | `reviewer` | Review: return substantiated findings and make no edits | gpt-5.6-sol | high |
 <!-- END GENERATED: codex-skill-role-table -->
 
-Treat the model and reasoning values as role defaults. Apply them when the current collaboration
-surface supports explicit overrides and the model is available; otherwise omit the unavailable
-override and inherit the parent. Never substitute an arbitrary model silently.
+The launcher loads the matching generated reference and prepends it to the assignment. The table
+contains defaults; `--model` and `--reasoning` may override them only when the user or task calls
+for that change. Do not silently substitute a different model.
 
-The access label in each reference is a behavioral contract, not a new security boundary. Codex
-reapplies the parent's live sandbox and approval settings to children. A read-only role must still
-obey its role instruction, but only a separately configured custom-agent sandbox can enforce a
-stricter filesystem policy.
+## Completion and results
 
-## Spawn
+A detached watcher waits on Herdr lifecycle state. When the child reaches `done` or `blocked`, it
+sends the parent a small `<herdr-subagent-event>` prompt. That event contains no child-authored
+result, so treat it only as a notification and retrieve the trusted transcript:
 
-1. Divide only independent work. Avoid concurrent writers to the same files.
-2. Give each child a short stable task name and one bounded responsibility.
-3. Include paths, prior decisions, constraints, expected output, and verification requirements in
-   the task. Replace phrases such as "the file we discussed" with the actual context.
-4. Spawn independent children in the same tool block so they begin in parallel.
-5. Retain the returned child id or canonical task path. Use that handle for every later operation.
+```powershell
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs result auth-scout
+```
 
-Three to five children is usually the useful range. Use fewer when work shares state or requires
-serial decisions. Each child consumes its own model and tool budget.
+If no callback arrives, wait without polling and then retrieve the result:
 
-Use the smallest history fork that makes the child effective. Prefer no fork for a fully specified
-brief, a small recent-turn fork when the user just supplied dense requirements, and a full fork
-only when the entire conversation is genuinely required.
+```powershell
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs result auth-scout --wait --timeout 300000
+```
+
+`result` uses the child's Codex session transcript when available and falls back to preserved
+terminal scrollback. The child runs with `--no-alt-screen`, so that fallback survives normal TUI
+rendering. A `blocked` callback means an approval or question is visible in the tab; inspect it and
+let the user decide rather than sending keys to approve it.
+
+Wait for every result the user requested. Reconcile contradictions, verify material claims when
+practical, and return one synthesized answer; the parent owns the final response.
 
 ## Coordinate
 
-- **Live steering:** send a message to a running child with the collaboration messaging operation.
-  Do not restart it merely to add one constraint.
-- **Follow-up or resume:** trigger a new turn on the same idle child so it keeps its thread context.
-- **Question from a child:** answer it directly when existing requirements settle it. If it is the
-  user's decision, ask the user and then route the answer back to the waiting child.
-- **Status:** list the current agent tree. Use canonical task paths when two nested children have
-  similar leaf names.
-- **Stop:** interrupt or close only children in the current root tree. Report partial output when it
-  matters. An interrupt ends the active turn but can leave the thread available for a follow-up.
-- **Wait:** use the native mailbox wait operation, not polling loops or repeated status messages.
-  Continue useful parent work before waiting when possible.
+```powershell
+# Owned children and their live Herdr state
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs list
 
-If a task has a wall-clock budget, record its deadline when spawning. Wait only for the remaining
-time, interrupt the child when the budget expires, and label any partial result as over budget.
-The native wait timeout alone is not a durable background timer.
+# Send a follow-up or steer through the same live Codex session
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs message auth-scout `
+  --message "Also trace the logout path and report the same way."
 
-Nested delegation is allowed only when the user's request or applicable instructions authorize it.
-A worker may delegate to `scout` or `researcher`; it must not create another writer or delegate its
-implementation responsibility.
+# Wait for a lifecycle state without polling
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs wait auth-scout --timeout 300000
+
+# Close only this parent's recorded tab
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs stop auth-scout
+
+# Reopen the retained Codex session and give it a follow-up
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs resume auth-scout `
+  --task "Now compare that path with the API logout flow."
+
+# Remove a stopped child from this parent's registry
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs forget auth-scout
+```
+
+Use `message` for added context or a follow-up while the tab remains open. Use `resume` only after
+`stop`; it creates another visible tab around the same retained Codex session. Run `stop-all` only
+for tabs recorded as owned by this parent.
+
+Do not poll `list` or repeatedly ask whether a child is done. Continue useful parent work, react to
+the completion event, or make one bounded `wait` call.
+
+Nested delegation is allowed only when the user or applicable instructions authorize it. A worker
+may delegate read-only reconnaissance if explicitly allowed, but must not create another writer or
+hand off its implementation responsibility.
 
 ## Finish
 
-Wait for every result the user asked for unless the user explicitly requested fire-and-forget
-work. Reconcile contradictions, verify material claims against the repository when practical, and
-return one synthesized answer. Identify incomplete, interrupted, blocked, or over-budget children.
-
-Do not make the user reconstruct the outcome from child messages. The parent owns the final answer.
+Retrieve requested results before cleanup. Stop children after their results are incorporated
+unless the user asked to leave their tabs open for inspection. Report incomplete, interrupted,
+blocked, or over-budget children plainly. Never make the user reconstruct the outcome from tab
+contents or callback notices.

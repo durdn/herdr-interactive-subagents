@@ -76,10 +76,12 @@ export function inspectCodexInstall(options = {}) {
   const source = codexSkillSource(options.root);
   const target = codexSkillTarget(options);
   const linked = linkTarget(target);
-  const sourceValid = existsSync(join(source, "SKILL.md"));
+  const launcher = join(source, "scripts", "codex-subagents.mjs");
+  const sourceValid = existsSync(join(source, "SKILL.md")) && existsSync(launcher);
   return {
     source,
     target,
+    launcher,
     linked,
     sourceValid,
     installed: sourceValid && Boolean(linked) && samePath(linked, source),
@@ -211,6 +213,7 @@ function runCodex(action, options = {}) {
 
   const state = inspectCodexInstall(options);
   out(`${state.sourceValid ? "ok  " : "FAIL"}  Codex skill source ${state.source}`);
+  out(`${existsSync(state.launcher) ? "ok  " : "FAIL"}  Codex Herdr launcher ${state.launcher}`);
   out(`${state.installed ? "ok  " : "FAIL"}  Codex user skill ${state.target}`);
   if (!state.sourceValid || !state.installed) throw new Error("Codex installation check failed");
 }

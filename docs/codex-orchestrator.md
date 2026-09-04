@@ -12,63 +12,116 @@ npm run harness:doctor -- codex
 The installer idempotently links this checkout's `skills/herdr-subagents` directory into the
 user-wide `~/.agents/skills/herdr-subagents` location and protects any foreign file already at that
 path. It does not create, configure, or publish a marketplace. Start a new Codex session after
-installing; the capability appears as the `herdr-subagents` skill, not as a marketplace plugin.
+installing so the skill catalog refreshes.
 
 The same command accepts `pi`, `claude`, or `all`; use `harness:uninstall` for the inverse operation.
 
-The Codex adapter ports the orchestration contract, not the external-process implementation used
-by Pi and Claude Code. Current Codex releases already provide native subagent threads, so the
-adapter is a skills-only Codex plugin.
+## Topology
+
+The Codex adapter now uses the same visible process topology as the Pi and Claude adapters. A child
+is an independent interactive Codex CLI in a background tab in the leader's Herdr workspace:
+
+```text
+Herdr workspace
+├─ leader tab       Codex orchestrator
+├─ auth-scout       independent Codex session
+├─ docs-research    independent Codex session
+└─ fix-worker       independent Codex session
+```
+
+These processes are not members of Codex's native subagent tree. They therefore do not have native
+child handles or a native parent mailbox. The adapter says so explicitly and uses Herdr as the
+transport instead of presenting the two topologies as equivalent.
 
 ## Primitive mapping
 
 | Project concept | Pi implementation | Claude implementation | Codex implementation |
 | --- | --- | --- | --- |
-| Async spawn | Extension tool plus watcher | Herdr tab plus `SendMessage` | Native subagent spawn |
-| Child identity | Registry handle | Claude session name and ownership registry | Native child id and canonical task path |
-| Result delivery | Pi steer | Cross-session message | Native child completion mailbox |
-| Live steering | `subagent_message` | `SendMessage` | Native child message/input |
-| Follow-up | Resume stored Pi session | Resume Claude session | Start a follow-up turn on the same child thread |
-| Question | `ask_question` sidecar | Child message to parent | Child message to its parent thread |
-| Status | Pi widget plus Herdr | Registry plus Herdr | Native agent tree and Codex Subagents UI |
-| Cancel | Close owned tab/session | Close owned tab; keep transcript | Interrupt or close the owned child thread |
-| Nested work | Enforced role allowlist | Disabled by the Claude launcher | Native nested task paths, constrained by the role contract |
+| Async spawn | Extension tool plus watcher | Herdr tab plus `SendMessage` | Herdr tab plus prompt and watcher |
+| Child identity | Registry handle | Claude session name and ownership registry | Codex session id and parent ownership registry |
+| Result delivery | Pi steer | Cross-session message | Static Herdr callback plus transcript retrieval |
+| Live steering | `subagent_message` | `SendMessage` | `herdr agent prompt` |
+| Follow-up | Resume stored Pi session | Resume Claude session | Resume retained Codex session |
+| Status | Pi widget plus Herdr | Registry plus Herdr | Registry plus live Herdr agent state |
+| Cancel | Close owned tab/session | Close owned tab; keep transcript | Close owned tab; keep transcript |
 
-## Why there is no Codex registry or watcher
+The launcher lives at
+[`skills/herdr-subagents/scripts/codex-subagents.mjs`](../skills/herdr-subagents/scripts/codex-subagents.mjs).
+It stores only the leader-to-child ownership records Herdr does not own. Live lifecycle state always
+comes back from Herdr. The registry is parent-session-scoped in the system temporary directory, so
+it neither dirties the repository nor lets one leader close another leader's tab.
 
-Codex owns thread persistence, result routing, follow-up delivery, hierarchy, and completion. A
-second filesystem registry would create competing identities and stale lifecycle state without
-adding capability. The skill retains the native child handle returned at spawn and uses Codex's
-own collaboration operations for every later action.
+## Result delivery
 
-The same reasoning rules out a callback hook. Native child completion already wakes and returns a
-result to the parent agent tree; intercepting it through terminal text would discard structured
-thread identity and make approval or question handling ambiguous.
+After submitting the initial prompt, the launcher starts a detached watcher. The watcher waits on
+Herdr's semantic `done`, `blocked`, or `unknown` state instead of polling. A completed or blocked
+child sends a static `<herdr-subagent-event>` prompt to the parent pane. The callback contains no
+child-authored text: it tells the leader to retrieve the result with the owned launcher command.
+That keeps untrusted task output out of the control channel.
 
-## Topology difference
+The full role and task are written to a parent-scoped temporary brief. Herdr submits only a short
+instruction pointing Codex at that file, then requires a state-observed submission handshake.
+Parent callbacks use the same handshake. This avoids the Codex bracketed-paste threshold, where a
+long fire-and-forget prompt can remain in the composer without consuming Enter.
 
-Pi and Claude Code need separate processes to get independent contexts, so Herdr places each one
-in a background tab. Codex subagents are independent threads inside the current Codex runtime.
-They are inspectable through the Subagents UI and `/agent`, but Herdr correctly detects only the
-parent Codex process in its terminal pane.
+`result` finds the Codex session id reported by Herdr and reads the last assistant message from the
+Codex JSONL transcript. The CLI is launched with `--no-alt-screen`, so retained Herdr scrollback is
+a useful fallback when a transcript is unavailable.
 
-Launching separate `codex` CLI processes in Herdr tabs is not equivalent. Those sessions do not
-join the parent's native task tree and have no documented native child handle or parent mailbox.
-The Codex skill therefore does not create tabs or claim external sessions are native children.
+## Permission propagation
 
-## Roles and permissions
+Codex's native children inherit the current sandbox and approval mode inside one runtime. A new CLI
+process does not. The launcher therefore reads `CODEX_PERMISSION_PROFILE`, which the Codex host
+injects into the leader's command environment, and maps the built-in profiles to explicit launch
+arguments:
 
-The canonical role catalog generates one Codex reference per role. The orchestrator reads the
-chosen reference and includes its full contract in the spawn message, along with a self-contained
-task brief. Model and reasoning defaults are applied only when the current surface supports them.
+| Leader profile | Child launch boundary |
+| --- | --- |
+| `:danger-full-access` | `--dangerously-bypass-approvals-and-sandbox` |
+| `:workspace` | `--sandbox workspace-write --ask-for-approval on-request` |
+| `:read-only` | `--sandbox read-only --ask-for-approval on-request` |
+| named custom profile | `-c default_permissions="<profile>"` |
 
-Codex reapplies the parent turn's live sandbox and approval policy to children. Consequently,
-`read-only` in a bundled role is an agent behavior contract, not a security boundary. Users who
-need enforced narrowing should define a Codex custom agent with `sandbox_mode = "read-only"` and
-use that agent type; the plugin does not mutate user-level Codex configuration during install.
+This explicit mapping fixes the practical failure where a leader granted full access still spawned
+children at their configured default and every child asked for approval again. The CLI flags are
+the enforcing mechanism; the profile environment value is only the leader-side source signal.
 
-## Packaging
+Role access remains a behavioral contract within that boundary. A scout is instructed not to edit,
+but a user who grants the entire delegated tree full access does not get a new approval boundary per
+role.
 
-The repository root is the plugin root. [`.codex-plugin/plugin.json`](../.codex-plugin/plugin.json)
-points to [`skills/`](../skills/), and the `herdr-subagents` skill contains only orchestration
-instructions plus generated role references. No MCP server or hook is required.
+## Windows executable resolution
+
+npm installs `codex` on Windows as PowerShell and cmd shims. Herdr's agent launcher uses
+`Start-Process -FilePath codex`, and Windows PowerShell 5.1 rejects those shims with `%1 is not a
+valid Win32 application`. The adapter resolves the platform package's actual `codex.exe` and
+prepends its directory to the child tab's `PATH`, retaining Herdr's normal `--kind codex` startup
+and agent detection. `HERDR_CODEX_EXE` is an explicit override for nonstandard installations.
+
+## Lifecycle
+
+The skill documents the stable installed path. The principal commands are:
+
+```bash
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs spawn --role scout --name map --cwd <dir> --task <brief>
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs list
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs message map --message <follow-up>
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs result map --wait --timeout 300000
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs stop map
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs resume map --task <follow-up>
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs forget map
+```
+
+Spawn creates and records the tab before starting the agent. An uncertain startup remains recorded
+and open for diagnosis rather than deleting a process that may have started late. Stop operates only
+on the exact tab id in the current parent's registry.
+
+## Roles and packaging
+
+The canonical role catalog generates one Codex reference per role. The launcher loads the chosen
+reference and prepends its full contract to a self-contained task brief. Model and reasoning values
+are passed as Codex CLI defaults and can be explicitly overridden.
+
+The repository root remains the skills-only plugin root.
+[`.codex-plugin/plugin.json`](../.codex-plugin/plugin.json) points to [`skills/`](../skills/); no MCP
+server, marketplace, or Codex configuration mutation is required.

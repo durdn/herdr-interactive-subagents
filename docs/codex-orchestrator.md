@@ -64,9 +64,26 @@ instruction pointing Codex at that file, then requires a state-observed submissi
 This avoids the Codex bracketed-paste threshold, where a long fire-and-forget prompt can remain in
 the composer without consuming Enter.
 
-`result` finds the Codex session id reported by Herdr and reads the last assistant message from the
-Codex JSONL transcript. The CLI is launched with `--no-alt-screen`, so retained Herdr scrollback is
-a useful fallback when a transcript is unavailable.
+`result` finds the Codex session id reported by Herdr and reads the Codex JSONL transcript. The CLI
+is launched with `--no-alt-screen`, so retained Herdr scrollback is a useful fallback when a
+transcript is unavailable.
+
+## Ledger
+
+The registry entry is also the child's ledger. Each brief carries an id (`b1` the assignment, `b2`
+onward the follow-ups), the delivery the launcher observed (`confirmed` after Herdr saw the state
+change, `sent` when the child was working and Codex queued the text) and the receipt: the timestamp
+of the transcript's user message that quotes the brief's file name. `result` types its text from the
+transcript's `task_started` and `task_complete` events, `final`, `progress`, `stale` or `blocked`,
+with the `Closes:` ids the child named. `list` and `result --json` add elapsed and active minutes,
+the transcript's token usage, and an `overBudget` flag against a `--budget-min` deadline; the
+watcher notifies past that deadline and stops nothing. Waits accept `idle`, the state Herdr shows
+for a finished tab the user has looked at. Resume keeps the recorded model and reasoning.
+
+The field run that paid for this: a follow-up sent to a working child returned a timeout although the
+child read it; `result --wait` timed out while three finished children sat `idle` with their finals
+readable; a wording follow-up displaced a three-defect correction and the next final reported only
+the wording; a resume without flags came back on the role's default model instead of the session's.
 
 ## Permission propagation
 
@@ -103,7 +120,7 @@ and agent detection. `HERDR_CODEX_EXE` is an explicit override for nonstandard i
 The skill documents the stable installed path. The principal commands are:
 
 ```bash
-node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs spawn --role scout --name map --cwd <dir> --task <brief>
+node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs spawn --role scout --name map --cwd <dir> --task <brief> [--budget-min <n>]
 node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs list
 node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs message map --message <follow-up>
 node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs result map --wait --timeout 300000

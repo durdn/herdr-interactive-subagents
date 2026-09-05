@@ -273,7 +273,10 @@ The Codex sessions are intentionally not presented as members of Codex's native 
 independent CLI processes have no native parent thread handle. Herdr is the explicit transport:
 each child appears as a real tab, a detached watcher shows a native Herdr notification, and the
 leader explicitly retrieves the child-authored result from its Codex transcript. A small registry
-in the system temporary directory preserves parent ownership without dirtying the repository.
+in the system temporary directory preserves parent ownership without dirtying the repository. It is
+also each child's ledger: brief ids as message receipts, a typed result (`final`, `progress`,
+`stale`, `blocked`) with the `Closes:` ids the child named, elapsed and active minutes, token usage,
+and a `--budget-min` deadline. Resume keeps the recorded model.
 
 Role references are generated from the same canonical [`roles/catalog.json`](roles/catalog.json)
 as the Pi and Claude definitions. The launcher converts the leader's live

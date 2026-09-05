@@ -101,7 +101,7 @@ if (args[0] === "agent" && args[1] === "prompt") {
   const agent = (state.live || []).find((item) =>
     item.name === args[2] || item.pane_id === args[2]);
   if (!agent) json({ error: { code: "agent_not_found" } }, 1);
-  agent.agent_status = "done";
+  agent.agent_status = process.env.HS_FAKE_PROMPT_STATUS || "done";
   agent.agent_session ||= { value: "fake-codex-session" };
   json({ result: { agent, type: "agent_prompted" } });
 }

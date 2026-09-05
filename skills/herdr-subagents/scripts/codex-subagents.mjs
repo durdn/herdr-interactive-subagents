@@ -37,6 +37,10 @@ const SHELL_READY_DELAY_MS = positiveNumber(process.env.HCS_SHELL_READY_DELAY_MS
 const SHELL_READY_TIMEOUT_MS = positiveNumber(process.env.HCS_SHELL_READY_TIMEOUT_MS, 30_000);
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 5_000;
+const RESULT_SETTLE_MS = 1_500;
+// Herdr's settled states. A finished tab the user has looked at reads idle, not done.
+const SETTLED_STATES = ["--until", "idle", "--until", "done", "--until", "blocked"];
+const PROMPT_START_STATES = ["--until", "working", "--until", "done", "--until", "blocked"];
 
 class HcsError extends Error {}
 
@@ -269,7 +273,23 @@ function taskText(opts) {
   return [].concat(opts.task || []).filter((part) => typeof part === "string").join("\n").trim();
 }
 
-function taskPrompt(role, task) {
+// A follow-up amends the assignment; it must not replace it. The child is told so, and
+// told to name every brief its final answer closes.
+function taskPrompt(role, task, brief) {
+  if (brief.kind === "follow-up") {
+    const all = [...brief.amends, brief.id].join(", ");
+    return [
+      `# Follow-up ${brief.id} to your assignment`,
+      "",
+      task,
+      "",
+      "# Session boundary",
+      "",
+      `Your assignment (${brief.amends.join(", ")}) stands; this follow-up amends it and closes nothing by itself.`,
+      `Finish everything still open, then begin your final answer with a line \`Closes: ${all}\` naming`,
+      "each brief it completes; a brief left unfinished stays off that line, with the reason in the answer.",
+    ].join("\n");
+  }
   return [
     "# Role contract",
     "",
@@ -283,21 +303,46 @@ function taskPrompt(role, task) {
     "",
     "You are a visible Codex child running in a Herdr tab. You do not inherit the parent conversation.",
     "Your final assistant message is the complete result that the parent will retrieve from this session.",
+    `Begin it with a line \`Closes: ${brief.id}\`. A follow-up you receive later names its own id; the assignment stands.`,
     "Do not delegate further unless the assignment explicitly authorizes nested delegation.",
   ].join("\n");
 }
 
-function writeBrief(entry, role, task) {
+// A brief id is the message receipt: the child's transcript quotes the brief's file name
+// when it reads it, and the final answer names the ids it closes.
+function nextBrief(entry, kind) {
+  const briefs = entry.briefs || [];
+  return {
+    id: `b${briefs.length + 1}`,
+    kind,
+    amends: kind === "follow-up" ? briefs.map((brief) => brief.id) : [],
+    sentAt: new Date().toISOString(),
+  };
+}
+
+function writeBrief(entry, role, task, brief) {
   const directory = join(dirname(registryPath()), "briefs");
   mkdirSync(directory, { recursive: true });
-  const path = join(directory, `${entry.name}-${randomUUID()}.md`);
-  writeFileSync(path, `${taskPrompt(role, task)}\n`);
+  const path = join(directory, `${entry.name}-${brief.id}-${randomUUID()}.md`);
+  writeFileSync(path, `${taskPrompt(role, task, brief)}\n`);
   return path;
 }
 
-function briefInstruction(path) {
+function briefInstruction(brief, path) {
   const portable = path.replaceAll("\\", "/");
+  if (brief.kind === "follow-up") {
+    return `Read follow-up ${brief.id} at ${portable} and fold it into your current assignment, which stands.`;
+  }
   return `Read the complete task brief at ${portable} and follow it. Return the requested deliverable as your final answer.`;
+}
+
+function budgetFields(opts, startedAt) {
+  if (opts.budgetMin === undefined) return { budgetMin: null, deadline: null };
+  const minutes = Number(opts.budgetMin);
+  if (opts.budgetMin === true || !Number.isFinite(minutes) || minutes <= 0) {
+    die("--budget-min needs a positive number of minutes");
+  }
+  return { budgetMin: minutes, deadline: new Date(Date.parse(startedAt) + minutes * 60_000).toISOString() };
 }
 
 function normalizePermissionProfile(profile = process.env.CODEX_PERMISSION_PROFILE) {
@@ -409,17 +454,32 @@ function tabEnvironmentArgs() {
   return { args, executable };
 }
 
-function codexLaunchArgs({ cwd, role, opts = {}, resumeSessionId = null }) {
+// A resumed session keeps the model and reasoning it ran on; the role's defaults are for
+// a fresh one. An explicit flag overrides either, and the caller reports the override.
+function pickSetting(override, recorded, fallback) {
+  if (override) return { value: override, source: "override" };
+  if (recorded) return { value: recorded, source: "recorded" };
+  return { value: fallback || null, source: "role" };
+}
+
+function codexLaunchArgs({ cwd, role, opts = {}, resumeSessionId = null, prior = null }) {
   const permission = codexPermissionArgs();
-  const model = opts.model === true ? die("--model needs a value") : opts.model || role.attributes.model;
-  const reasoning = opts.reasoning === true
-    ? die("--reasoning needs a value")
-    : opts.reasoning || role.attributes.reasoning;
+  if (opts.model === true) die("--model needs a value");
+  if (opts.reasoning === true) die("--reasoning needs a value");
+  const model = pickSetting(opts.model, prior?.model, role.attributes.model);
+  const reasoning = pickSetting(opts.reasoning, prior?.reasoning, role.attributes.reasoning);
   const args = [...permission.args, "--no-alt-screen", "-C", cwd];
-  if (model) args.push("--model", model);
-  if (reasoning) args.push("-c", `model_reasoning_effort="${reasoning}"`);
+  if (model.value) args.push("--model", model.value);
+  if (reasoning.value) args.push("-c", `model_reasoning_effort="${reasoning.value}"`);
   if (resumeSessionId) args.push("resume", resumeSessionId);
-  return { args, model: model || null, reasoning: reasoning || null, permission };
+  return {
+    args,
+    model: model.value,
+    reasoning: reasoning.value,
+    modelSource: model.source,
+    reasoningSource: reasoning.source,
+    permission,
+  };
 }
 
 function startAgentInPane(name, paneId, agentArgs, timeoutMs = START_TIMEOUT_MS) {
@@ -486,7 +546,9 @@ function launchChild({ name, role, cwd, opts, resumeSessionId = null, prior = nu
   ensureNameFree(name);
   if (!existsSync(cwd) || !lstatSync(cwd).isDirectory()) die(`--cwd is not a directory: ${cwd}`);
   const workspace = callerWorkspace();
-  const launch = codexLaunchArgs({ cwd, role, opts, resumeSessionId });
+  const launch = codexLaunchArgs({ cwd, role, opts, resumeSessionId, prior });
+  const startedAt = new Date().toISOString();
+  const budget = budgetFields(opts, startedAt);
   const created = createChildTab(name, cwd, workspace);
   let entry = {
     ...(prior || {}),
@@ -498,10 +560,13 @@ function launchChild({ name, role, cwd, opts, resumeSessionId = null, prior = nu
     paneId: created.paneId,
     model: launch.model,
     reasoning: launch.reasoning,
+    modelSource: launch.modelSource,
+    reasoningSource: launch.reasoningSource,
     permissionProfile: launch.permission.profile,
     permissionDescription: launch.permission.description,
     codexExecutable: created.codexExecutable,
-    startedAt: new Date().toISOString(),
+    startedAt,
+    ...budget,
     stoppedAt: null,
     status: "starting",
   };
@@ -532,37 +597,56 @@ function launchChild({ name, role, cwd, opts, resumeSessionId = null, prior = nu
   return { entry, role, launch };
 }
 
-function submitTask(entry, role, task, { wait = false, timeout } = {}) {
-  const briefPath = writeBrief(entry, role, task);
-  entry = { ...entry, briefPaths: [...(entry.briefPaths || []), briefPath] };
-  upsertChild(entry);
-  const args = ["agent", "prompt", entry.name, briefInstruction(briefPath), "--wait"];
-  if (wait) {
-    args.push("--until", "done", "--until", "blocked");
-    if (timeout !== undefined) args.push("--timeout", String(timeout));
-  } else {
-    // A long Codex bracketed paste can still be sitting in the composer after
-    // Herdr has written it. Waiting for the first semantic transition proves
-    // that Enter was consumed before spawn returns, without waiting for the
-    // whole child task.
-    args.push("--until", "working", "--until", "done", "--until", "blocked");
-    args.push("--timeout", String(PROMPT_START_TIMEOUT_MS));
+function submitTask(entry, role, task, { wait = false, timeout, kind = "task" } = {}) {
+  const live = confirmAgent(entry.name, entry.paneId);
+  const status = live?.agent_status || entry.status;
+  if (status === "blocked") {
+    die(`'${entry.name}' is blocked: an approval or question is open in its tab; nothing was sent`);
   }
+  const brief = nextBrief(entry, kind);
+  brief.path = writeBrief(entry, role, task, brief);
+  const args = ["agent", "prompt", entry.name, briefInstruction(brief, brief.path)];
+  if (wait) {
+    args.push("--wait", ...SETTLED_STATES);
+    if (timeout !== undefined) args.push("--timeout", String(timeout));
+    brief.delivery = "confirmed";
+  } else if (status === "working") {
+    // Herdr's --wait matches a state change, and a working child shows none until its
+    // turn ends; Codex queues the input behind that turn. Send without the wait and let
+    // the transcript confirm the receipt, instead of calling a delivered message a timeout.
+    brief.delivery = "sent";
+  } else {
+    // A long Codex bracketed paste can still be sitting in the composer after Herdr has
+    // written it. Waiting for the first semantic transition proves that Enter was consumed
+    // before spawn returns, without waiting for the whole child task.
+    args.push("--wait", ...PROMPT_START_STATES, "--timeout", String(PROMPT_START_TIMEOUT_MS));
+    brief.delivery = "confirmed";
+  }
+  entry = { ...entry, briefs: [...(entry.briefs || []), brief] };
+  upsertChild(entry);
   const submitted = herdrJson(args, { allowFailure: true });
   if (!submitted?.result?.agent) {
-    die(`could not deliver task to '${entry.name}': ${submitted?.error?.message || "unknown Herdr error"}`);
+    const code = submitted?.error?.code || "unknown";
+    upsertChild({
+      ...entry,
+      briefs: entry.briefs.map((item) => (item.id === brief.id ? { ...item, delivery: `failed:${code}` } : item)),
+    });
+    const hint = code === "agent_prompt_stalled"
+      ? "Herdr saw no state change within 5 s; the text may sit in the composer, open the tab"
+      : submitted?.error?.message || "unknown Herdr error";
+    die(`could not deliver ${brief.id} to '${entry.name}' (${code}): ${hint}`);
   }
   const agent = submitted.result.agent;
   const updated = {
     ...entry,
-    status: agent.agent_status || "working",
+    status: agent.agent_status || status || "working",
     sessionId: agent.agent_session?.value || entry.sessionId || null,
-    lastPromptAt: new Date().toISOString(),
-    briefPaths: entry.briefPaths,
+    lastPromptAt: brief.sentAt,
   };
   upsertChild(updated);
-  startWatcher(updated.name);
-  return updated;
+  // A queued brief rides the watcher the running turn already has.
+  if (brief.delivery !== "sent") startWatcher(updated.name);
+  return { entry: updated, brief };
 }
 
 function cmdSpawn(opts) {
@@ -572,7 +656,7 @@ function cmdSpawn(opts) {
   const name = spawnName(role.name, opts.name);
   const cwd = resolve(opts.cwd === true ? die("--cwd needs a value") : opts.cwd || process.cwd());
   const launched = launchChild({ name, role, cwd, opts });
-  const entry = submitTask(launched.entry, role, task);
+  const { entry } = submitTask(launched.entry, role, task);
   console.log(JSON.stringify({
     ...entry,
     next: `visible child launched; run result ${name} --wait to collect its answer`,
@@ -591,8 +675,12 @@ function refreshEntry(entry) {
 }
 
 function cmdList(opts) {
-  const entries = readRegistry({ strict: true }).children.map(refreshEntry);
-  for (const entry of entries) upsertChild(entry);
+  const entries = readRegistry({ strict: true }).children.map((entry) => {
+    const refreshed = refreshEntry(entry);
+    const full = enrich(refreshed).entry;
+    upsertChild({ ...refreshed, briefs: full.briefs });
+    return full;
+  });
   if (opts.json) {
     console.log(JSON.stringify(entries, null, 2));
     return;
@@ -602,14 +690,15 @@ function cmdList(opts) {
     return;
   }
   const pad = (value, size) => String(value ?? "-").padEnd(size);
-  console.log(`${pad("NAME", 24)}${pad("ROLE", 13)}${pad("STATUS", 12)}TAB`);
+  console.log(`${pad("NAME", 24)}${pad("ROLE", 13)}${pad("STATUS", 10)}${pad("KIND", 10)}${pad("MIN", 8)}TAB`);
   for (const entry of entries) {
-    console.log(`${pad(entry.name, 24)}${pad(entry.role, 13)}${pad(entry.status, 12)}${entry.tabId || "-"}`);
+    const minutes = entry.elapsedMin === null ? "-" : `${entry.elapsedMin}${entry.overBudget ? "!" : ""}`;
+    console.log(`${pad(entry.name, 24)}${pad(entry.role, 13)}${pad(entry.status, 10)}${pad(entry.kind, 10)}${pad(minutes, 8)}${entry.tabId || "-"}`);
   }
 }
 
 function waitForAgent(entry, opts = {}) {
-  const args = ["agent", "wait", entry.name, "--until", "done", "--until", "blocked", "--until", "unknown"];
+  const args = ["agent", "wait", entry.name, ...SETTLED_STATES, "--until", "unknown"];
   if (opts.timeout !== undefined) {
     if (opts.timeout === true || !Number.isFinite(Number(opts.timeout)) || Number(opts.timeout) <= 0) {
       die("--timeout needs a positive number of milliseconds");
@@ -652,12 +741,28 @@ function findFileContaining(root, needle) {
   return null;
 }
 
+function codexHome() {
+  return process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(homedir(), ".codex");
+}
+
 function transcriptPath(sessionId) {
-  for (const root of [join(homedir(), ".codex", "sessions"), join(homedir(), ".codex", "archived_sessions")]) {
+  for (const root of [join(codexHome(), "sessions"), join(codexHome(), "archived_sessions")]) {
     const found = findFileContaining(root, sessionId);
     if (found) return found;
   }
   return null;
+}
+
+function readTranscript(sessionId) {
+  const path = sessionId ? transcriptPath(sessionId) : null;
+  if (!path) return null;
+  const events = [];
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try { events.push(JSON.parse(line)); }
+    catch { /* a partial final line */ }
+  }
+  return events;
 }
 
 function assistantText(payload) {
@@ -670,25 +775,108 @@ function assistantText(payload) {
   return text || null;
 }
 
-function lastAssistantMessage(sessionId) {
-  const path = transcriptPath(sessionId);
-  if (!path) return null;
-  const lines = readFileSync(path, "utf8").trim().split(/\r?\n/).reverse();
-  for (const line of lines) {
-    try {
-      const event = JSON.parse(line);
-      if (event.type === "response_item") {
-        const text = assistantText(event.payload);
-        if (text) return text;
+// The Codex rollout is the child's own record. task_started and task_complete bound a
+// turn, so the last assistant message inside a finished turn is a final and one inside a
+// running turn is progress; a user message quoting a brief's file name is that brief's
+// receipt; token_count carries the usage.
+function transcriptState(sessionId, briefs = []) {
+  const events = readTranscript(sessionId);
+  if (!events) return null;
+  const state = { turns: [], running: null, lastAssistant: null, usage: null, acknowledged: {} };
+  for (const event of events) {
+    const payload = event.payload || {};
+    if (event.type === "event_msg") {
+      if (payload.type === "task_started") {
+        state.running = { startedAt: event.timestamp };
+        state.lastAssistant = null;
+      } else if (payload.type === "task_complete") {
+        state.turns.push({
+          startedAt: state.running?.startedAt || null,
+          completedAt: event.timestamp,
+          text: payload.last_agent_message?.trim() || state.lastAssistant,
+        });
+        state.running = null;
+      } else if (payload.type === "token_count" && payload.info?.total_token_usage) {
+        state.usage = payload.info.total_token_usage;
       }
-      const item = event.type === "event_msg" ? event.payload?.item : null;
-      if (item?.type === "AgentMessage") {
-        const text = (item.content || []).map((part) => part.text || "").join("").trim();
-        if (text) return text;
+      continue;
+    }
+    if (event.type !== "response_item" || payload.type !== "message") continue;
+    if (payload.role === "assistant") state.lastAssistant = assistantText(payload) || state.lastAssistant;
+    if (payload.role !== "user") continue;
+    const text = (payload.content || []).map((part) => part.text || "").join("");
+    for (const brief of briefs) {
+      if (!state.acknowledged[brief.id] && brief.path && text.includes(basename(brief.path))) {
+        state.acknowledged[brief.id] = event.timestamp;
       }
-    } catch { /* ignore a partial final line */ }
+    }
   }
-  return null;
+  return state;
+}
+
+// The child may bold or punctuate the line; only brief ids count.
+function parseCloses(text) {
+  const head = (text || "").split(/\r?\n/).slice(0, 3).join("\n");
+  const match = /^[\s*_`#]*closes[\s*_`]*:?\s*(.+)$/im.exec(head);
+  if (!match) return [];
+  return match[1]
+    .split(/[,\s]+/)
+    .map((id) => id.replace(/[`*_.]/g, "").toLowerCase())
+    .filter((id) => /^b\d+$/.test(id));
+}
+
+// final: a turn finished after the latest brief was sent, and that brief's receipt is in
+// it. progress: a turn is running. stale: the child has not answered the latest brief.
+// blocked: Herdr reports an approval or question open in the tab.
+function resultKind(entry, state) {
+  const latest = (entry.briefs || []).at(-1);
+  const since = latest?.sentAt || entry.lastPromptAt || entry.startedAt || "";
+  if (entry.status === "blocked") return { kind: "blocked", text: state?.lastAssistant || null };
+  if (!state) return { kind: "none", text: null };
+  if (state.running) return { kind: "progress", text: state.lastAssistant };
+  const receipt = latest ? state.acknowledged[latest.id] : null;
+  const finished = state.turns
+    .filter((turn) => turn.completedAt >= since && (!latest || (receipt && receipt <= turn.completedAt)))
+    .at(-1);
+  if (finished) return { kind: "final", text: finished.text };
+  return { kind: "stale", text: state.turns.at(-1)?.text || null };
+}
+
+function enrich(entry) {
+  const briefs = entry.briefs || [];
+  const state = transcriptState(entry.sessionId, briefs);
+  const { kind, text } = resultKind(entry, state);
+  const now = Date.now();
+  const minutes = (ms) => Math.round(ms / 6_000) / 10;
+  const activeMs = state
+    ? state.turns.reduce((sum, turn) => sum + (turn.startedAt ? Date.parse(turn.completedAt) - Date.parse(turn.startedAt) : 0), 0)
+      + (state.running ? now - Date.parse(state.running.startedAt) : 0)
+    : null;
+  const usage = state?.usage;
+  const until = entry.stoppedAt ? Date.parse(entry.stoppedAt) : now;
+  return {
+    entry: {
+      ...entry,
+      briefs: briefs.map((brief) => ({
+        ...brief,
+        acknowledgedAt: state?.acknowledged[brief.id] || brief.acknowledgedAt || null,
+      })),
+      kind,
+      closes: kind === "final" ? parseCloses(text) : [],
+      elapsedMin: entry.startedAt ? minutes(until - Date.parse(entry.startedAt)) : null,
+      activeMin: activeMs === null ? null : minutes(activeMs),
+      overBudget: Boolean(entry.deadline && !entry.stoppedAt && kind !== "final" && now > Date.parse(entry.deadline)),
+      usage: usage
+        ? {
+          totalTokens: usage.total_tokens,
+          inputTokens: usage.input_tokens,
+          cachedInputTokens: usage.cached_input_tokens,
+          outputTokens: usage.output_tokens,
+        }
+        : null,
+    },
+    text,
+  };
 }
 
 function terminalFallback(entry, lines = 200) {
@@ -702,26 +890,48 @@ function terminalFallback(entry, lines = 200) {
 
 function cmdResult(name, opts) {
   let entry = requireOwned(name);
-  if (opts.wait) entry = waitForAgent(entry, opts);
-  else {
-    entry = refreshEntry(entry);
-    upsertChild(entry);
+  entry = opts.wait ? waitForAgent(entry, opts) : refreshEntry(entry);
+  // The transcript can trail Herdr's state by a moment; a settled child gets that long.
+  let full = enrich(entry);
+  const deadline = Date.now() + RESULT_SETTLE_MS;
+  while (
+    ["done", "idle"].includes(entry.status)
+    && ["progress", "none"].includes(full.entry.kind)
+    && Date.now() < deadline
+  ) {
+    sleepSync(100);
+    full = enrich(entry);
   }
-
-  let text = entry.sessionId ? lastAssistantMessage(entry.sessionId) : null;
-  if (!text && ["done", "idle"].includes(entry.status)) {
-    for (let attempt = 0; attempt < 10 && !text; attempt++) {
-      sleepSync(100);
-      text = entry.sessionId ? lastAssistantMessage(entry.sessionId) : null;
-    }
-  }
-  const source = text ? "transcript" : "terminal";
-  text ||= terminalFallback(entry, opts.lines === true ? 200 : Number(opts.lines) || 200);
+  upsertChild({ ...entry, briefs: full.entry.briefs });
+  const { kind, closes, briefs, overBudget } = full.entry;
+  const source = full.text ? "transcript" : "terminal";
+  const text = full.text || terminalFallback(entry, opts.lines === true ? 200 : Number(opts.lines) || 200);
   if (opts.json) {
-    console.log(JSON.stringify({ name, status: entry.status, sessionId: entry.sessionId || null, source, text }, null, 2));
-  } else {
-    console.log(text || `(no result available for '${name}')`);
+    console.log(JSON.stringify({
+      name,
+      status: entry.status,
+      kind,
+      closes,
+      briefs,
+      sessionId: entry.sessionId || null,
+      elapsedMin: full.entry.elapsedMin,
+      activeMin: full.entry.activeMin,
+      budgetMin: entry.budgetMin ?? null,
+      overBudget,
+      usage: full.entry.usage,
+      source,
+      text,
+    }, null, 2));
+    return;
   }
+  const receipts = briefs.map((brief) => `${brief.id} ${brief.acknowledgedAt ? "acknowledged" : brief.delivery || "-"}`).join(", ");
+  console.log([
+    `# ${name}: ${kind}, status ${entry.status}`,
+    closes.length ? `closes ${closes.join(", ")}` : null,
+    `briefs ${receipts || "-"}`,
+    overBudget ? "over budget" : null,
+  ].filter(Boolean).join("; "));
+  console.log(text || `(no result available for '${name}')`);
 }
 
 function cmdMessage(name, opts, positional) {
@@ -732,11 +942,20 @@ function cmdMessage(name, opts, positional) {
     : opts.message || positional.join(" ");
   if (!message?.trim()) die("message needs --message <text>");
   const role = loadRole(entry.role);
-  const updated = submitTask(entry, role, message.trim(), {
+  const { entry: updated, brief } = submitTask(entry, role, message.trim(), {
     wait: Boolean(opts.wait),
     timeout: opts.timeout,
+    kind: "follow-up",
   });
-  console.log(JSON.stringify({ name, status: updated.status, sessionId: updated.sessionId || null }, null, 2));
+  console.log(JSON.stringify({
+    name,
+    status: updated.status,
+    sessionId: updated.sessionId || null,
+    brief: { id: brief.id, amends: brief.amends, delivery: brief.delivery },
+    next: brief.delivery === "sent"
+      ? `queued behind the running turn; result ${name} --json shows acknowledgedAt on ${brief.id} once the child reads it`
+      : `delivered; result ${name} --wait collects the answer that closes ${[...brief.amends, brief.id].join(", ")}`,
+  }, null, 2));
 }
 
 function cmdStop(name) {
@@ -769,7 +988,8 @@ function cmdForget(name) {
     registry.children = registry.children.filter((child) => child.name !== name);
   });
   const briefDirectory = resolve(dirname(registryPath()), "briefs");
-  for (const path of entry.briefPaths || []) {
+  const briefPaths = [...(entry.briefPaths || []), ...(entry.briefs || []).map((brief) => brief.path).filter(Boolean)];
+  for (const path of briefPaths) {
     const candidate = resolve(path);
     if (dirname(candidate) === briefDirectory) rmSync(candidate, { force: true });
   }
@@ -789,25 +1009,52 @@ function cmdResume(name, opts) {
     resumeSessionId: prior.sessionId,
     prior,
   });
+  const notes = [];
+  if (launched.launch.modelSource === "override" && prior.model && prior.model !== launched.launch.model) {
+    notes.push(`model override ${launched.launch.model} replaces recorded ${prior.model}`);
+  }
+  if (launched.launch.reasoningSource === "override" && prior.reasoning && prior.reasoning !== launched.launch.reasoning) {
+    notes.push(`reasoning override ${launched.launch.reasoning} replaces recorded ${prior.reasoning}`);
+  }
+  if (prior.budgetMin && opts.budgetMin === undefined) notes.push("the earlier budget is not carried; pass --budget-min to set one");
   const task = taskText(opts);
-  const entry = task ? submitTask(launched.entry, role, task) : launched.entry;
-  console.log(JSON.stringify({ ...entry, next: task ? "follow-up delivered" : "resumed and idle" }, null, 2));
+  const kind = (prior.briefs || []).length ? "follow-up" : "task";
+  const entry = task ? submitTask(launched.entry, role, task, { kind }).entry : launched.entry;
+  console.log(JSON.stringify({ ...entry, notes, next: task ? "follow-up delivered" : "resumed and idle" }, null, 2));
+}
+
+function notify(title, body, sound) {
+  herdrJson([
+    "notification", "show", title, "--body", body, "--position", "bottom-right", "--sound", sound,
+  ], { allowFailure: true });
 }
 
 function cmdWatch(name) {
   if (!NAME_RE.test(name || "")) process.exit(0);
-  const waited = herdrJson([
-    "agent", "wait", name, "--until", "done", "--until", "blocked", "--until", "unknown",
-  ], { allowFailure: true });
+  const entry = readRegistry().children.find((child) => child.name === name);
+  const remaining = entry?.deadline ? Date.parse(entry.deadline) - Date.now() : null;
+  const args = ["agent", "wait", name, ...SETTLED_STATES, "--until", "unknown"];
+  if (remaining !== null) args.push("--timeout", String(Math.max(remaining, 1_000)));
+  const waited = herdrJson(args, { allowFailure: true });
   const status = waited?.result?.agent?.agent_status;
-  if (!status || status === "unknown") process.exit(0);
+  // A wait that ends with no settled state ended on the budget.
+  if (!status || status === "working") {
+    if (remaining !== null) {
+      notify(
+        "Herdr agent over budget",
+        `${name} is still working past its ${entry.budgetMin} min budget. The leader decides: stop it or let it run.`,
+        "request",
+      );
+    }
+    process.exit(0);
+  }
+  if (status === "unknown") process.exit(0);
   const blocked = status === "blocked";
-  herdrJson([
-    "notification", "show", blocked ? "Herdr agent needs attention" : "Herdr agent finished",
-    "--body", `${name} is ${status}. ${blocked ? "Open its tab to review the prompt." : "The leader can collect its result."}`,
-    "--position", "bottom-right",
-    "--sound", blocked ? "request" : "done",
-  ], { allowFailure: true });
+  notify(
+    blocked ? "Herdr agent needs attention" : "Herdr agent finished",
+    `${name} is ${status}. ${blocked ? "Open its tab to review the prompt." : "The leader can collect its result."}`,
+    blocked ? "request" : "done",
+  );
 }
 
 function cmdDoctor() {
@@ -839,13 +1086,13 @@ function usage() {
   console.error([
     "usage: codex-subagents.mjs <command> [options]",
     "",
-    "  spawn --role <role> --task <brief> [--name <name>] [--cwd <dir>]",
-    "  list [--json]",
-    "  message <name> --message <text> [--wait]",
+    "  spawn --role <role> --task <brief> [--name <name>] [--cwd <dir>] [--model <m>] [--reasoning <r>] [--budget-min <n>]",
+    "  list [--json]                       status, kind, minutes, budget flag per child",
+    "  message <name> --message <text> [--wait]   a follow-up brief; queued when the child is working",
     "  wait <name> [--timeout <ms>]",
-    "  result <name> [--wait] [--timeout <ms>] [--json]",
+    "  result <name> [--wait] [--timeout <ms>] [--json]   kind: final, progress, stale, blocked",
     "  stop <name> | stop-all",
-    "  resume <name> [--task <follow-up>]",
+    "  resume <name> [--task <follow-up>] [--model <m>] [--reasoning <r>] [--budget-min <n>]   keeps the recorded model",
     "  forget <name>",
     "  doctor",
   ].join("\n"));
@@ -886,11 +1133,13 @@ if (invokedDirectly) main();
 
 export {
   codexPermissionArgs,
-  lastAssistantMessage,
   main,
   normalizePermissionProfile,
   parseArgs,
+  parseCloses,
   parseFrontmatter,
   resolveWindowsCodexExecutable,
+  resultKind,
   tabEnvironmentArgs,
+  transcriptState,
 };

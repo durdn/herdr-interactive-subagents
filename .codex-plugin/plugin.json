@@ -1,6 +1,6 @@
 {
   "name": "herdr-interactive-subagents",
-  "version": "4.0.3",
+  "version": "4.1.0",
   "description": "Role-based Codex subagent orchestration for sessions running in Herdr",
   "author": {
     "name": "Amos Blomqvist",

@@ -49,6 +49,10 @@ one short instruction telling Codex to read that file. This avoids Codex's brack
 where a long direct prompt can remain in the composer without Enter being consumed. Quotes and
 newlines in `--task` are safe; use `--task-file <path>` if the calling shell's argv limit is a risk.
 
+`--budget-min <minutes>` records a deadline. The watcher notifies when the child is still working
+past it, and `list` and `result --json` flag `overBudget`. The launcher stops nothing on its own;
+stopping or extending is the leader's call.
+
 ## Permissions
 
 The launcher reads the leader's live `CODEX_PERMISSION_PROFILE` and converts it to explicit Codex
@@ -105,10 +109,15 @@ To wait for completion and retrieve the result in one bounded command:
 node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs result auth-scout --wait --timeout 300000
 ```
 
-`result` uses the child's Codex session transcript when available and falls back to preserved
-terminal scrollback. The child runs with `--no-alt-screen`, so that fallback survives normal TUI
-rendering. A `blocked` notification means an approval or question is visible in the tab; inspect it
-and let the user decide rather than sending keys to approve it.
+`result` reads the child's Codex transcript and types what it finds. `final`: the turn that
+answered the latest brief has completed. `progress`: a turn is running and the text is the child's
+last remark, not a deliverable. `stale`: the child has not read the latest brief. `blocked`: an
+approval or question is open in the tab; inspect it and let the user decide rather than sending
+keys to approve it. The first output line carries the kind, the Herdr status, the `Closes:` ids the
+child named and each brief's receipt; `--json` adds `briefs`, `closes`, `elapsedMin`, `activeMin`,
+`usage` and `overBudget`. `--wait` returns on `idle` as well as `done`, so a tab the user has
+already looked at still completes the wait. Without a transcript the text is preserved terminal
+scrollback; the child runs with `--no-alt-screen`, so that fallback survives normal TUI rendering.
 
 Wait for every result the user requested. Reconcile contradictions, verify material claims when
 practical, and return one synthesized answer; the parent owns the final response.
@@ -140,6 +149,15 @@ node ~/.agents/skills/herdr-subagents/scripts/codex-subagents.mjs forget auth-sc
 Use `message` for added context or a follow-up while the tab remains open. Use `resume` only after
 `stop`; it creates another visible tab around the same retained Codex session. Run `stop-all` only
 for tabs recorded as owned by this parent.
+
+Every brief has an id: `b1` is the assignment, each `message` adds `b2`, `b3`. A follow-up amends
+the assignment and closes nothing by itself; the child is told to finish everything still open and
+to begin its final answer with `Closes: b1, b2`. A `message` to a `working` child is queued behind
+the running turn and returns `delivery: sent`; `result --json` shows `acknowledgedAt` on the brief
+once the child has read it. A brief still unacknowledged after the turn ends did not arrive; resend
+it then, not before. A `message` to a `blocked` child is refused before anything is typed.
+`resume` keeps the recorded model and reasoning; `--model` and `--reasoning` override them and the
+output names the override. The earlier budget is not carried.
 
 Do not poll `list` or repeatedly ask whether a child is done. Continue useful parent work and use
 one bounded `result --wait` call per child. Herdr's notification is user-facing status, not a hidden

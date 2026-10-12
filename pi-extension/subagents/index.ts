@@ -697,7 +697,8 @@ function applySandboxToParts(
   }
 
   // Default-deny: disable global extension discovery and re-enable only the
-  // extensions backing the whitelisted tools. A null allowlist means the spawn
+  // extensions backing the whitelisted tools, plus Herdr's installed state
+  // telemetry integration. A null allowlist means the spawn
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
@@ -707,6 +708,13 @@ function applySandboxToParts(
     for (const tool of loadout.toolAllowlist.split(",")) {
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
+    }
+    // --no-extensions also disables non-tool integrations. Preserve Herdr state
+    // evidence without reopening discovery or granting any additional tools.
+    // Resume uses the saved agent directory before falling back to current config.
+    if (process.env.HERDR_ENV === "1") {
+      const stateExtension = join(loadout.agentDir ?? getAgentConfigDir(), "extensions", "herdr-agent-state.ts");
+      if (existsSync(stateExtension)) extPaths.add(stateExtension);
     }
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));

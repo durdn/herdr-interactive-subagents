@@ -1485,6 +1485,54 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("restricted launches preserve installed Herdr state telemetry from the effective config", () => {
+    withTempDir((d) => {
+      const savedHerdr = process.env.HERDR_ENV;
+      const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+      const currentDir = join(d, "current");
+      const snapshotDir = join(d, "snapshot");
+      const statePath = (dir: string) => join(dir, "extensions", "herdr-agent-state.ts");
+      for (const dir of [currentDir, snapshotDir]) {
+        mkdirSync(join(dir, "extensions"), { recursive: true });
+        writeFileSync(statePath(dir), "export default () => {};", "utf8");
+      }
+      const loadout: SubagentLoadout = {
+        version: SUBAGENT_LOADOUT_VERSION,
+        agent: "worker", toolAllowlist: "read", model: null, thinking: null,
+        systemPromptMode: null, identity: null, spawnable: null, autoExit: true,
+        cwd: null, agentDir: null,
+      };
+      const apply = (overrides: Partial<SubagentLoadout> = {}) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, { ...loadout, ...overrides }, { artifactDir: d, name: "worker" });
+        return parts;
+      };
+      try {
+        process.env.PI_CODING_AGENT_DIR = currentDir;
+        process.env.HERDR_ENV = "1";
+        const spawned = apply();
+        assert.deepEqual(spawned, ["--no-extensions", "--tools", shellEscape("read"), "-e", shellEscape(statePath(currentDir))]);
+        const resumed = apply({ agentDir: snapshotDir });
+        assert.deepEqual(resumed, ["--no-extensions", "--tools", shellEscape("read"), "-e", shellEscape(statePath(snapshotDir))]);
+        assert.deepEqual(apply({ agentDir: join(d, "missing") }), ["--no-extensions", "--tools", shellEscape("read")]);
+        assert.deepEqual(apply({ toolAllowlist: null }), []);
+
+        // A registered tool may already refer to the integration; emit it once.
+        subagentsModule.registerToolExtension("test_herdr_state_dedup", statePath(snapshotDir));
+        const deduped = apply({ agentDir: snapshotDir, toolAllowlist: "read,test_herdr_state_dedup" });
+        assert.equal(deduped.filter((part) => part === "-e").length, 1);
+
+        delete process.env.HERDR_ENV;
+        assert.deepEqual(apply(), ["--no-extensions", "--tools", shellEscape("read")]);
+        process.env.HERDR_ENV = "0";
+        assert.deepEqual(apply(), ["--no-extensions", "--tools", shellEscape("read")]);
+      } finally {
+        restoreEnvVar("HERDR_ENV", savedHerdr);
+        restoreEnvVar("PI_CODING_AGENT_DIR", savedAgentDir);
+      }
+    });
+  });
+
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
